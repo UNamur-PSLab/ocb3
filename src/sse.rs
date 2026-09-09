@@ -11,29 +11,29 @@ macro_rules! _MM_SHUFFLE_FIXME {
 }
 
 #[inline(always)]
-pub(crate) unsafe fn zero_block() -> __m128i { unsafe {
+pub(crate) fn zero_block() -> __m128i { unsafe {
     _mm_setzero_si128()
 }}
 
 #[inline(always)]
-pub(crate) unsafe fn xor_block(a: __m128i, b: __m128i) -> __m128i { unsafe {
+pub(crate) fn xor_block(a: __m128i, b: __m128i) -> __m128i { unsafe {
     _mm_xor_si128(a, b)
 }}
 
 #[inline(always)]
-pub(crate) unsafe fn unequal_blocks(a: __m128i, b: __m128i) -> bool { unsafe {
+pub(crate) fn unequal_blocks(a: __m128i, b: __m128i) -> bool { unsafe {
     _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) != 0xffff
 }}
 
 /// Reverse the 16 bytes
 #[inline(always)]
-pub(crate) unsafe fn swap_if_le(block: __m128i) { unsafe {
+pub(crate) fn swap_if_le(block: __m128i) -> __m128i { unsafe {
     let mask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    _mm_shuffle_epi8(block, mask);
+    _mm_shuffle_epi8(block, mask)
 }}
 
 #[inline(always)]
-pub(crate) unsafe fn gen_offset(KtopStr: &[u64; 3], bot: i32) -> __m128i { unsafe {
+pub(crate) fn gen_offset(KtopStr: &[u64; 3], bot: i32) -> __m128i { unsafe {
     let ptr_KtopStr = KtopStr.as_ptr();
     let hi = _mm_load_si128(ptr_KtopStr as *const __m128i);
     let mut lo = _mm_loadu_si128(ptr_KtopStr.add(1) as *const __m128i);
@@ -50,7 +50,7 @@ pub(crate) unsafe fn gen_offset(KtopStr: &[u64; 3], bot: i32) -> __m128i { unsaf
 /// a polynomial where the first 32-bits is the most significant part
 /// of the polynomial.
 #[inline(always)]
-pub(crate) unsafe fn double(mut block: __m128i) -> __m128i { unsafe {
+pub(crate) fn double(mut block: __m128i) -> __m128i { unsafe {
     let mask = _mm_set_epi32(0x87, 1, 1, 1);
     // Get the sign for each dword
     let mut tmp = _mm_srai_epi32::<31>(block);
