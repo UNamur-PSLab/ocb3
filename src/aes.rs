@@ -40,33 +40,31 @@ macro_rules! expand_assist {
 }
 
 impl AesKey {
-    unsafe fn AES_128_key_expansion(userkey: &[u8], rd_key: &mut [__m128i; 11]) {
-        unsafe {
-            let mut x0 = _mm_loadu_si128(userkey.as_ptr() as *const __m128i);
+    unsafe fn AES_128_key_expansion(userkey: &[u8], rd_key: &mut [__m128i; 11]) { unsafe {
+        let mut x0 = _mm_loadu_si128(userkey.as_ptr() as *const __m128i);
 
-            rd_key[0] = x0;
-            let mut x1 = _mm_setzero_si128();
-            let mut x2 = x1;
-            expand_assist!(x0, x1, x2, x0, 255, 1);
-            rd_key[1] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 2);
-            rd_key[2] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 4);
-            rd_key[3] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 8);
-            rd_key[4] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 16);
-            rd_key[5] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 32);
-            rd_key[6] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 64);
-            rd_key[7] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 128);
-            rd_key[8] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 27);
-            rd_key[9] = x0;
-            expand_assist!(x0, x1, x2, x0, 255, 54);
-            rd_key[10] = x0;
-        }
-    }
+        rd_key[0] = x0;
+        let mut x1 = _mm_setzero_si128();
+        let mut x2 = x1;
+        expand_assist!(x0, x1, x2, x0, 255, 1);
+        rd_key[1] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 2);
+        rd_key[2] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 4);
+        rd_key[3] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 8);
+        rd_key[4] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 16);
+        rd_key[5] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 32);
+        rd_key[6] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 64);
+        rd_key[7] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 128);
+        rd_key[8] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 27);
+        rd_key[9] = x0;
+        expand_assist!(x0, x1, x2, x0, 255, 54);
+        rd_key[10] = x0;
+    }}
 }
