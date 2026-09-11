@@ -10,6 +10,13 @@ macro_rules! _MM_SHUFFLE_FIXME {
     };
 }
 
+const BSWAP_MASK: __m128i = unsafe {
+    std::mem::transmute([
+        7u8, 6, 5, 4, 3, 2, 1, 0,
+        15, 14, 13, 12, 11, 10, 9, 8,
+    ])
+};
+
 #[inline(always)]
 pub(crate) fn zero_block() -> __m128i { unsafe {
     _mm_setzero_si128()
@@ -58,4 +65,12 @@ pub(crate) fn double(mut block: __m128i) -> __m128i { unsafe {
     tmp = _mm_shuffle_epi32(tmp, _MM_SHUFFLE_FIXME!(2, 1, 0, 3)); // shift
     block = _mm_slli_epi32(block, 1);
     _mm_xor_si128(block, tmp) // applies carry
+}}
+
+#[inline(always)]
+pub fn m128i_to_bswap_u64x2(val: __m128i) -> [u64; 2] { unsafe {
+    [
+        (_mm_cvtsi128_si64(val) as u64).swap_bytes(),
+        (_mm_extract_epi64(val, 1) as u64).swap_bytes()
+    ]
 }}

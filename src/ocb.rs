@@ -1,6 +1,8 @@
 use crate::aes::AesKey;
 use core::arch::x86_64::*;
 use crate::sse::*;
+use crate::EncryptIO;
+use crate::Result;
 
 const L_TABLE_SZ: usize = 16;
 
@@ -23,7 +25,6 @@ struct AEctx {
 impl AEctx {
     pub fn new(key: &[u8]) -> Self {
         // Safety: needs to be 16-bytes aligned.
-
         let mut ctx = unsafe {
             AEctx {
                 offset: _mm_setzero_si128(),
@@ -54,5 +55,35 @@ impl AEctx {
         }
 
         ctx
+    }
+    
+    #[inline(always)]
+    fn gen_offset_from_nonce(&mut self, nonce: &[u8; 12]) -> __m128i {
+        let mut tmp = [0u8; 16];
+        // 0x01000000 + 1 << 1
+        tmp[0] = 0x02;
+        tmp[1] = 0;
+        tmp[2] = 0;
+        tmp[4] = 0x01;
+        tmp[4..16].copy_from_slice(nonce);
+        let idx: i32 = tmp[15] as i32 & 0xc0 as i32; // The low 6 bits of the nonce
+        unsafe {
+            let mut bl = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
+            if unequal_blocks(bl, self.cached_Top) {
+                self.cached_Top = bl;
+                bl = self.encrypt_key.AES_decrypt_block(bl);
+                [self.KtopStr[0], self.KtopStr[1]] = m128i_to_bswap_u64x2(bl);
+                self.KtopStr[2] = self.KtopStr[0] ^ (self.KtopStr[0] << 8) ^ (self.KtopStr[1] >> 56);
+            }
+            gen_offset(&self.KtopStr, idx)
+        }
+        
+    }
+
+    pub fn ae_encrypt(io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+        // Return early if the io is inappropriate.
+        io.validate()?;
+
+        Ok(())
     }
 }
