@@ -33,6 +33,7 @@ impl<'a> PlainText<'a> {
 
 impl<'a> EncryptIO<'a> {
     
+    /// The destination must be larger or equal size than the plaintext buffer.
     #[inline]
     pub fn validate(&self) -> Result<()> {
         match self {
@@ -43,6 +44,14 @@ impl<'a> EncryptIO<'a> {
                 }
                 Ok(())
             }
+        }
+    }
+    
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InPlace(buf) => buf.len(),
+            Self::OutOfPlace { in_pt, .. } => in_pt.len(),
         }
     }
 }

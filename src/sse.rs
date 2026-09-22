@@ -1,4 +1,4 @@
-/// Requires SSE3
+/// Requires SSE3, SSE4.1
 use core::arch::x86_64::*;
 
 // from https://github.com/rust-lang-nursery/stdsimd/pull/479 not yet merged
@@ -9,13 +9,6 @@ macro_rules! _MM_SHUFFLE_FIXME {
         ($z << 6) | ($y << 4) | ($x << 2) | $w
     };
 }
-
-const BSWAP_MASK: __m128i = unsafe {
-    std::mem::transmute([
-        7u8, 6, 5, 4, 3, 2, 1, 0,
-        15, 14, 13, 12, 11, 10, 9, 8,
-    ])
-};
 
 #[inline(always)]
 pub(crate) fn zero_block() -> __m128i { unsafe {
@@ -60,13 +53,14 @@ pub(crate) fn gen_offset(KtopStr: &[u64; 3], bot: i32) -> __m128i { unsafe {
 pub(crate) fn double(mut block: __m128i) -> __m128i { unsafe {
     let mask = _mm_set_epi32(0x87, 1, 1, 1);
     // Get the sign for each dword
-    let mut tmp = _mm_srai_epi32::<31>(block);
+    let mut tmp = _mm_srai_epi32(block, 31);
     tmp = _mm_and_si128(tmp, mask); // bitwise AND
     tmp = _mm_shuffle_epi32(tmp, _MM_SHUFFLE_FIXME!(2, 1, 0, 3)); // shift
     block = _mm_slli_epi32(block, 1);
     _mm_xor_si128(block, tmp) // applies carry
 }}
 
+// Requires SSE4.1
 #[inline(always)]
 pub fn m128i_to_bswap_u64x2(val: __m128i) -> [u64; 2] { unsafe {
     [

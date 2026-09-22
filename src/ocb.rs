@@ -5,6 +5,7 @@ use crate::EncryptIO;
 use crate::Result;
 
 const L_TABLE_SZ: usize = 16;
+const BPI: usize = 8;
 
 #[repr(C, align(16))]
 struct AEctx {
@@ -14,6 +15,7 @@ struct AEctx {
     Ldollar: __m128i,
     L: [__m128i; L_TABLE_SZ],
     ad_checksum: __m128i,
+    ad_offset: __m128i,
     cached_Top: __m128i,
     decrypt_key: AesKey,
     encrypt_key: AesKey,
@@ -33,6 +35,7 @@ impl AEctx {
                 Ldollar: _mm_setzero_si128(),
                 L: [_mm_setzero_si128(); L_TABLE_SZ],
                 ad_checksum: _mm_setzero_si128(),
+                ad_offset: _mm_setzero_si128(),
                 cached_Top: _mm_setzero_si128(),
                 decrypt_key: AesKey::default(),
                 encrypt_key: AesKey::default(),
@@ -79,11 +82,29 @@ impl AEctx {
         }
         
     }
+    
+    #[inline(always)]
+    fn process_ad(&mut self, ad: &[u8]) {}
 
-    pub fn ae_encrypt(io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+    pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         // Return early if the io is inappropriate.
         io.validate()?;
+        self.offset = self.gen_offset_from_nonce(nonce);
+        // SAFETY: memory is 16-bytes aligned
+        unsafe {
+            self.ad_offset = _mm_setzero_si128();
+            self.checksum = _mm_setzero_si128();
+        }
 
+        if !ad.is_empty() {
+            self.process_ad(ad);
+        }
+        
+        let mut offset = self.offset;
+        let mut checksum  = self.checksum;
+
+        let i = io.len() / (BPI * 16);
+        
         Ok(())
     }
 }
