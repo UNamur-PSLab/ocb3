@@ -8,7 +8,7 @@ pub type Result<T> = std::result::Result<T, CryptoError>;
 /// of two different memory buffers.
 pub enum PlainText<'a> {
     Contiguous(&'a [u8]),
-    Scattered(&'a [u8], &'a [u8])
+    Scattered(&'a [u8], &'a [u8]),
 }
 
 /// An encryption can either be in place or out of place. In the case of out of place encryption
@@ -18,7 +18,7 @@ pub enum EncryptIO<'a> {
     OutOfPlace {
         in_pt: PlainText<'a>,
         out: &'a mut [u8],
-    }
+    },
 }
 
 impl<'a> PlainText<'a> {
@@ -32,7 +32,6 @@ impl<'a> PlainText<'a> {
 }
 
 impl<'a> EncryptIO<'a> {
-    
     /// The destination must be larger or equal size than the plaintext buffer.
     #[inline]
     pub fn validate(&self) -> Result<()> {
@@ -46,7 +45,7 @@ impl<'a> EncryptIO<'a> {
             }
         }
     }
-    
+
     #[inline]
     pub fn len(&self) -> usize {
         match self {
@@ -55,7 +54,6 @@ impl<'a> EncryptIO<'a> {
         }
     }
 }
-
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
