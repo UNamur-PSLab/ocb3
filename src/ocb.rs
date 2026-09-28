@@ -65,18 +65,15 @@ impl AEctx {
     #[inline(always)]
     fn gen_offset_from_nonce(&mut self, nonce: &[u8; 12]) -> __m128i {
         let mut tmp = [0u8; 16];
-        // 0x01000000 + 1 << 1
-        tmp[0] = 0x02;
-        tmp[1] = 0;
-        tmp[2] = 0;
-        tmp[4] = 0x01;
+        tmp[3] = 0x01;
         tmp[4..16].copy_from_slice(nonce);
-        let idx: i32 = tmp[15] as i32 & 0xc0 as i32; // The low 6 bits of the nonce
+        let idx: i32 = tmp[15] as i32 & 0x3f;
+        tmp[15] &= 0xc0;
         unsafe {
             let mut bl = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
             if unequal_blocks(bl, self.cached_Top) {
                 self.cached_Top = bl;
-                bl = self.encrypt_key.AES_decrypt_block(bl);
+                bl = self.encrypt_key.AES_encrypt_block(bl);
                 [self.KtopStr[0], self.KtopStr[1]] = m128i_to_bswap_u64x2(bl);
                 self.KtopStr[2] =
                     self.KtopStr[0] ^ (self.KtopStr[0] << 8) ^ (self.KtopStr[1] >> 56);
