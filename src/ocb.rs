@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use crate::EncryptIO;
 use crate::PlainText;
 use crate::Result;
@@ -89,37 +90,156 @@ impl AEctx {
     #[inline(always)]
     fn process_ad(&mut self, ad: &[u8]) {}
 
+    /// Encrypts one 16-byte block
+    /// Returns (oa, new_checksum).
+    #[inline(always)]
+    unsafe fn enc_block(
+        &mut self,
+        offset: __m128i,
+        l: __m128i,
+        pt_ptr: *const u8,
+        ct_ptr: *mut u8,
+        checksum: __m128i,
+    ) -> (__m128i, __m128i) {
+        let oa = xor_block(offset, l);
+        let pt = _mm_loadu_si128(pt_ptr as *const __m128i);
+        let t = xor_block(oa, pt);
+        let ct = self.encrypt_key.AES_encrypt_block(t);
+        _mm_storeu_si128(ct_ptr as *mut __m128i, xor_block(ct, oa));
+        (oa, xor_block(checksum, pt))
+    }
+
+    /// Encrypts a full BPI (8-block) group using the algebraic offset shortcut.
+    /// `block_num` is the block count **before** this group.
+    /// Returns `(new_offset, new_checksum, new_block_num)`.
+    #[inline(always)]
+    unsafe fn enc_bpi(
+        &mut self,
+        offset: __m128i,
+        pt_ptr: *const u8,
+        ct_ptr: *mut u8,
+        block_num: u32,
+        checksum: __m128i,
+    ) -> (__m128i, __m128i, u32) {
+        let block_num = block_num + BPI as u32;
+        let l0 = self.L[0];
+        let l1 = self.L[1];
+        let l2 = self.L[2];
+        let cs = checksum;
+
+        let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
+        let (oa1, cs) = self.enc_block(oa0, l1, pt_ptr.add(16), ct_ptr.add(16), cs);
+        let (oa2, cs) = self.enc_block(oa1, l0, pt_ptr.add(32), ct_ptr.add(32), cs);
+        let (_oa3, cs) = self.enc_block(oa2, l2, pt_ptr.add(48), ct_ptr.add(48), cs);
+        // algebraic shortcuts — shorter dependency chains for OoO execution
+        let (_oa4, cs) = self.enc_block(oa1, l2, pt_ptr.add(64), ct_ptr.add(64), cs);
+        let (_oa5, cs) = self.enc_block(oa0, l2, pt_ptr.add(80), ct_ptr.add(80), cs);
+        let (oa6, cs) = self.enc_block(offset, l2, pt_ptr.add(96), ct_ptr.add(96), cs);
+        let ntz = block_num.trailing_zeros() as usize;
+        let (oa7, cs) = self.enc_block(oa6, self.L[ntz], pt_ptr.add(112), ct_ptr.add(112), cs);
+
+        (oa7, cs, block_num)
+    }
+
+    /// Encrypts full 16-byte blocks from the front of `remaining` bytes
+    /// Returns `(new_offset, new_checksum, new_pt_ptr, new_ct_ptr, new_remaining)`.
+    #[inline(always)]
+    unsafe fn enc_full_blocks(
+        &mut self,
+        mut offset: __m128i,
+        mut pt_ptr: *const u8,
+        mut ct_ptr: *mut u8,
+        mut remaining: usize,
+        checksum: __m128i,
+    ) -> (__m128i, __m128i, *const u8, *mut u8, usize) {
+        let l0 = self.L[0];
+        let l1 = self.L[1];
+        let l2 = self.L[2];
+        let cs = checksum;
+
+        if remaining >= 64 {
+            let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
+            let (oa1, cs) = self.enc_block(oa0, l1, pt_ptr.add(16), ct_ptr.add(16), cs);
+            let (oa2, cs) = self.enc_block(oa1, l0, pt_ptr.add(32), ct_ptr.add(32), cs);
+            let (oa3, cs) = self.enc_block(oa2, l2, pt_ptr.add(48), ct_ptr.add(48), cs);
+            offset = oa3;
+            remaining -= 64;
+            pt_ptr = pt_ptr.add(64);
+            ct_ptr = ct_ptr.add(64);
+        }
+        if remaining >= 32 {
+            let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
+            let (oa1, cs) = self.enc_block(oa0, l1, pt_ptr.add(16), ct_ptr.add(16), cs);
+            offset = oa1;
+            remaining -= 32;
+            pt_ptr = pt_ptr.add(32);
+            ct_ptr = ct_ptr.add(32);
+        }
+        if remaining >= 16 {
+            let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
+            offset = oa0;
+            remaining -= 16;
+            pt_ptr = pt_ptr.add(16);
+            ct_ptr = ct_ptr.add(16);
+        }
+        (offset, cs, pt_ptr, ct_ptr, remaining)
+    }
+
+    /// Encrypts the final partial block (`len < 16`) with `0x80` padding and L*.
+    /// Returns `(new_offset, new_checksum)`.
+    #[inline(always)]
+    unsafe fn enc_tail(
+        &mut self,
+        data_ptr: *const u8,
+        data_len: usize,
+        offset: __m128i,
+        ct_ptr: *mut u8,
+        checksum: __m128i,
+    ) -> (__m128i, __m128i) {
+        let mut tmp = [0u8; 16];
+        core::ptr::copy_nonoverlapping(data_ptr, tmp.as_mut_ptr(), data_len);
+        tmp[data_len] = 0x80;
+        let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
+        let cs = xor_block(checksum, pt_padded);
+        let t = xor_block(offset, self.Lstar);
+        let pad = self.encrypt_key.AES_encrypt_block(t);
+        let mut pad_bytes = [0u8; 16];
+        _mm_storeu_si128(pad_bytes.as_mut_ptr() as *mut __m128i, pad);
+        for i in 0..data_len {
+            *ct_ptr.add(i) = tmp[i] ^ pad_bytes[i];
+        }
+        (t, cs)
+    }
+
+    // ---------------------------------------------------------------------
+    //  Main encryption
+    // ---------------------------------------------------------------------
+
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
-        // Return early if the io is inappropriate.
         io.validate()?;
         self.offset = self.gen_offset_from_nonce(nonce);
-        // SAFETY: memory must be 16-bytes aligned
         unsafe {
             self.ad_offset = _mm_setzero_si128();
             self.checksum = _mm_setzero_si128();
         }
-
         if !ad.is_empty() {
             self.process_ad(ad);
         }
-
-        let mut offset = self.offset;
-        let mut checksum = self.checksum;
 
         let (
             mut pt1_ptr,
             mut pt2_ptr,
             mut ct_ptr,
             num_bpi_pt1,
-            mut remaining_pt1,
+            mut rem_pt1,
             mut num_bpi_pt2,
-            mut remaining_pt2,
+            mut rem_pt2,
         ) = match io {
             EncryptIO::InPlace(buf) => (
                 buf.as_ptr(),
                 std::ptr::null(),
                 buf.as_mut_ptr(),
-                buf.len() / BPI * 16,
+                buf.len() / (BPI * 16),
                 buf.len() % (BPI * 16),
                 0,
                 0,
@@ -129,7 +249,7 @@ impl AEctx {
                     pt.as_ptr(),
                     std::ptr::null(),
                     out.as_mut_ptr(),
-                    pt.len() / BPI * 16,
+                    pt.len() / (BPI * 16),
                     pt.len() % (BPI * 16),
                     0,
                     0,
@@ -138,782 +258,92 @@ impl AEctx {
                     pt1.as_ptr(),
                     pt2.as_ptr(),
                     out.as_mut_ptr(),
-                    pt1.len() / BPI * 16,
+                    pt1.len() / (BPI * 16),
                     pt1.len() % (BPI * 16),
-                    pt2.len() / BPI * 16,
+                    pt2.len() / (BPI * 16),
                     pt2.len() % (BPI * 16),
                 ),
             },
         };
 
         unsafe {
-            if num_bpi_pt1 > 0 {
-                let mut oa = [_mm_setzero_si128(); BPI];
-                let mut block_num = self.blocks_processed;
-                oa[BPI - 1] = offset;
-                let mut ta = [_mm_setzero_si128(); BPI];
-                for _ in 0..num_bpi_pt1 {
-                    block_num += BPI as u32;
-                    if BPI == 8 {
-                        oa[0] = xor_block(oa[BPI - 1], self.L[0]);
-                        let pt0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                        // Preparing inputs to the PRP
-                        ta[0] = xor_block(oa[0], pt0);
-                        let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                        let ct0 = xor_block(ct0, oa[0]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                        checksum = xor_block(checksum, pt0);
-                        oa[1] = xor_block(oa[0], self.L[1]);
-                        let pt1 = _mm_loadu_si128(pt1_ptr.add(16) as *const __m128i);
-                        ta[1] = xor_block(oa[1], pt1);
-                        let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                        let ct1 = xor_block(ct1, oa[1]);
-                        _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                        checksum = xor_block(checksum, pt1);
-                        oa[2] = xor_block(oa[1], self.L[0]);
-                        let pt2 = _mm_loadu_si128(pt1_ptr.add(32) as *const __m128i);
-                        ta[2] = xor_block(oa[2], pt2);
-                        let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                        let ct2 = xor_block(ct2, oa[2]);
-                        _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                        checksum = xor_block(checksum, pt2);
-                        oa[3] = xor_block(oa[2], self.L[2]);
-                        let pt3 = _mm_loadu_si128(pt1_ptr.add(48) as *const __m128i);
-                        ta[3] = xor_block(oa[3], pt3);
-                        let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                        let ct3 = xor_block(ct3, oa[3]);
-                        _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                        checksum = xor_block(checksum, pt3);
-                        // this allows the cpu to parallelize more efficiently, instead of using
-                        // oa[3] and L[0]; this is equivalent tho.
-                        oa[4] = xor_block(oa[1], self.L[2]);
-                        let pt4 = _mm_loadu_si128(pt1_ptr.add(64) as *const __m128i);
-                        ta[4] = xor_block(oa[4], pt4);
-                        let ct4 = self.encrypt_key.AES_encrypt_block(ta[4]);
-                        let ct4 = xor_block(ct4, oa[4]);
-                        _mm_storeu_si128(ct_ptr.add(64) as *mut __m128i, ct4);
-                        checksum = xor_block(checksum, pt4);
-                        oa[5] = xor_block(oa[0], self.L[2]);
-                        let pt5 = _mm_loadu_si128(pt1_ptr.add(80) as *const __m128i);
-                        ta[5] = xor_block(oa[5], pt5);
-                        let ct5 = self.encrypt_key.AES_encrypt_block(ta[5]);
-                        let ct5 = xor_block(ct5, oa[5]);
-                        _mm_storeu_si128(ct_ptr.add(80) as *mut __m128i, ct5);
-                        checksum = xor_block(checksum, pt5);
-                        oa[6] = xor_block(oa[7], self.L[2]);
-                        let pt6 = _mm_loadu_si128(pt1_ptr.add(96) as *const __m128i);
-                        ta[6] = xor_block(oa[6], pt6);
-                        let ct6 = self.encrypt_key.AES_encrypt_block(ta[6]);
-                        let ct6 = xor_block(ct6, oa[6]);
-                        _mm_storeu_si128(ct_ptr.add(96) as *mut __m128i, ct6);
-                        checksum = xor_block(checksum, pt6);
-                        let ntz = block_num.trailing_zeros() as usize;
-                        oa[7] = xor_block(oa[6], self.L[ntz]);
-                        let pt7 = _mm_loadu_si128(pt1_ptr.add(112) as *const __m128i);
-                        ta[7] = xor_block(oa[7], pt7);
-                        let ct7 = self.encrypt_key.AES_encrypt_block(ta[7]);
-                        let ct7 = xor_block(ct7, oa[7]);
-                        _mm_storeu_si128(ct_ptr.add(112) as *mut __m128i, ct7);
-                        checksum = xor_block(checksum, pt7);
-                    }
+            let mut offset = self.offset;
+            let mut checksum = self.checksum;
+            let mut block_num = self.blocks_processed;
 
-                    pt1_ptr = pt1_ptr.add(128);
-                    ct_ptr = ct_ptr.add(128);
-                }
-                self.offset = oa[BPI - 1];
-                offset = self.offset;
-                self.blocks_processed = block_num;
-                self.checksum = checksum;
+            // full BPI groups from pt1
+            for _ in 0..num_bpi_pt1 {
+                (offset, checksum, block_num) =
+                    self.enc_bpi(offset, pt1_ptr, ct_ptr, block_num, checksum);
+                pt1_ptr = pt1_ptr.add(BPI * 16);
+                ct_ptr = ct_ptr.add(BPI * 16);
+            }
 
-                let mut tmp = [0u8; 16];
-                let mut k = 0;
-                // We have to handle several cases:
-                //  - remaining_pt1 is > 0 && num_bpi_pt2 > 0 && remaining_pt2 > 0
-                //  - remaining_pt1 is > 0 && num_bpi_pt2 > 0 && remaining_pt2 = 0
-                //  - remaining_pt1 is > 0 && num_bpi_pt2 = 0 && remaining_pt2 > 0
-                //  - remaining_pt1 is > 0 && num_npi_pt2 = 0 && remaining_pt2 = 0
-                if remaining_pt1 >= 64 {
-                    oa[0] = xor_block(offset, self.L[0]);
-                    let pt0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                    ta[0] = xor_block(oa[0], pt0);
-                    let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                    let ct0 = xor_block(ct0, oa[0]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                    checksum = xor_block(checksum, pt0);
-                    oa[1] = xor_block(oa[0], self.L[1]);
-                    let pt1 = _mm_loadu_si128(pt1_ptr.add(16) as *const __m128i);
-                    ta[1] = xor_block(oa[1], pt1);
-                    let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                    let ct1 = xor_block(ct1, oa[1]);
-                    _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                    checksum = xor_block(checksum, pt1);
-                    oa[2] = xor_block(oa[1], self.L[0]);
-                    let pt2 = _mm_loadu_si128(pt1_ptr.add(32) as *const __m128i);
-                    ta[2] = xor_block(oa[2], pt2);
-                    let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                    let ct2 = xor_block(ct2, oa[2]);
-                    _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                    checksum = xor_block(checksum, pt2);
-                    oa[3] = xor_block(oa[2], self.L[2]);
-                    offset = oa[3];
-                    let pt3 = _mm_loadu_si128(pt1_ptr.add(48) as *const __m128i);
-                    ta[3] = xor_block(offset, pt3);
-                    let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                    let ct3 = xor_block(ct3, oa[3]);
-                    _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                    checksum = xor_block(checksum, pt3);
-                    remaining_pt1 -= 64;
-                    k = 4;
-                    pt1_ptr = pt1_ptr.add(64);
-                    ct_ptr = ct_ptr.add(64);
-                }
-                if remaining_pt1 >= 32 {
-                    oa[k] = xor_block(offset, self.L[0]);
-                    let ptk0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                    ta[k] = xor_block(oa[k], ptk0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    let ctk0 = xor_block(ctk0, oa[k]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, ptk0);
-                    oa[k + 1] = xor_block(oa[k], self.L[1]);
-                    offset = oa[k + 1];
-                    let ptk1 = _mm_loadu_si128(pt1_ptr.add(16) as *const __m128i);
-                    ta[k + 1] = xor_block(oa[k + 1], ptk1);
-                    let ctk1 = self.encrypt_key.AES_encrypt_block(ta[k + 1]);
-                    let ctk1 = xor_block(ctk1, oa[k + 1]);
-                    _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ctk1);
-                    checksum = xor_block(checksum, ptk1);
-                    remaining_pt1 -= 32;
-                    k += 2;
-                    pt1_ptr = pt1_ptr.add(32);
-                    ct_ptr = ct_ptr.add(32);
-                }
-                if remaining_pt1 >= 16 {
-                    oa[k] = xor_block(offset, self.L[0]);
-                    offset = oa[k];
-                    let ptk0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                    ta[k] = xor_block(offset, ptk0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    let ctk0 = xor_block(ctk0, oa[k]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, ptk0);
-                    remaining_pt1 -= 16;
-                    k += 1;
-                    pt1_ptr = pt1_ptr.add(16);
-                    ct_ptr = ct_ptr.add(16);
-                }
-                if remaining_pt1 > 0 && num_bpi_pt2 > 0 {
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                    core::ptr::copy_nonoverlapping(
-                        pt2_ptr,
-                        tmp.as_mut_ptr().add(remaining_pt1),
-                        16 - remaining_pt1,
-                    );
-                    if remaining_pt2 < 16 - remaining_pt1 {
-                        num_bpi_pt2 -= 1;
-                        remaining_pt2 = 16 * BPI - (remaining_pt2 - (16 - remaining_pt1));
-                    } else {
-                        remaining_pt2 -= 16 - remaining_pt1;
-                    }
-                    let pt0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                    oa[k] = xor_block(offset, self.L[0]);
-                    offset = oa[k];
-                    ta[k] = xor_block(offset, pt0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    let ctk0 = xor_block(ctk0, oa[k]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, pt0);
-                    pt2_ptr = pt2_ptr.add(16 - remaining_pt1);
-                    remaining_pt1 = 0;
-                    ct_ptr = ct_ptr.add(16);
-                    k += 1;
-                }
+            // full blocks from pt1 remainder
+            if rem_pt1 >= 16 {
+                (offset, checksum, pt1_ptr, ct_ptr, rem_pt1) =
+                    self.enc_full_blocks(offset, pt1_ptr, ct_ptr, rem_pt1, checksum);
+            }
 
-                if remaining_pt1 > 0 && num_bpi_pt2 == 0 && remaining_pt2 == 0 {
-                    let mut enc_pad = [0u8; 16];
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                    tmp[remaining_pt1] = 0x80;
-                    let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                    checksum = xor_block(checksum, pt_padded);
-                    ta[k] = xor_block(offset, self.Lstar);
-                    offset = ta[k];
-                    let pad = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    _mm_storeu_si128(enc_pad.as_mut_ptr() as *mut __m128i, pad);
-                    for i in 0..remaining_pt1 {
-                        *ct_ptr.add(i) = tmp[i] ^ enc_pad[i];
-                    }
-                    ct_ptr = ct_ptr.add(remaining_pt1);
-                    k += 1;
-                    remaining_pt1 = 0;
-                }
-
-                if remaining_pt1 > 0 && num_bpi_pt2 == 0 && remaining_pt2 > 0 {
-                    // remainin_pt1 must be < 16 bytes; remaining_pt2 is 0 <= remaining_pt2 <
-                    // 16*BPI
-                    if remaining_pt1 + remaining_pt2 == 16 {
-                        // we can reassemble then encrypt on a full block length (it should be a
-                        // rare case.
-                        core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                        core::ptr::copy_nonoverlapping(
-                            pt2_ptr,
-                            tmp.as_mut_ptr().add(remaining_pt1),
-                            remaining_pt2,
-                        );
-                        remaining_pt1 = 0;
-                        remaining_pt2 = 0;
-                        let pt0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                        oa[k] = xor_block(offset, self.L[0]);
-                        offset = oa[k];
-                        ta[k] = xor_block(offset, pt0);
-                        let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        let ctk0 = xor_block(ctk0, oa[k]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                        checksum = xor_block(checksum, pt0);
-                        ct_ptr = ct_ptr.add(16);
-                    } else if remaining_pt1 + remaining_pt2 < 16 {
-                        let mut enc_pad = [0u8; 16];
-                        core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                        core::ptr::copy_nonoverlapping(
-                            pt2_ptr,
-                            tmp.as_mut_ptr().add(remaining_pt1),
-                            remaining_pt2,
-                        );
-                        tmp[remaining_pt1 + remaining_pt2] = 0x80;
-                        let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                        checksum = xor_block(checksum, pt_padded);
-                        ta[k] = xor_block(offset, self.Lstar);
-                        offset = ta[k];
-                        let pad = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        _mm_storeu_si128(enc_pad.as_mut_ptr() as *mut __m128i, pad);
-                        for i in 0..remaining_pt1 + remaining_pt2 {
-                            *ct_ptr.add(i) = tmp[i] ^ enc_pad[i];
-                        }
-                        k += 1;
-                        ct_ptr = ct_ptr.add(remaining_pt1 + remaining_pt2);
-                        remaining_pt1 = 0;
-                        remaining_pt2 = 0;
-                    } else {
-                        // > 16
-                        core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                        core::ptr::copy_nonoverlapping(
-                            pt2_ptr,
-                            tmp.as_mut_ptr().add(remaining_pt1),
-                            16 - remaining_pt1,
-                        );
-                        remaining_pt2 -= 16 - remaining_pt1;
-                        let pt0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                        oa[0] = xor_block(offset, self.L[0]);
-                        offset = oa[0];
-                        ta[0] = xor_block(offset, pt0);
-                        let ctk0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                        let ctk0 = xor_block(ctk0, oa[0]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                        checksum = xor_block(checksum, pt0);
-                        pt2_ptr = pt2_ptr.add(16 - remaining_pt1);
-                        remaining_pt1 = 0;
-                        ct_ptr = ct_ptr.add(16);
-                        k = 0;
-                        if remaining_pt2 >= 64 {
-                            oa[0] = xor_block(offset, self.L[0]);
-                            let pt0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                            ta[0] = xor_block(oa[0], pt0);
-                            let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                            let ct0 = xor_block(ct0, oa[0]);
-                            _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                            checksum = xor_block(checksum, pt0);
-                            oa[1] = xor_block(oa[0], self.L[1]);
-                            let pt1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                            ta[1] = xor_block(oa[1], pt1);
-                            let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                            let ct1 = xor_block(ct1, oa[1]);
-                            _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                            checksum = xor_block(checksum, pt1);
-                            oa[2] = xor_block(oa[1], self.L[0]);
-                            let pt2 = _mm_loadu_si128(pt2_ptr.add(32) as *const __m128i);
-                            ta[2] = xor_block(oa[2], pt2);
-                            let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                            let ct2 = xor_block(ct2, oa[2]);
-                            _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                            checksum = xor_block(checksum, pt2);
-                            oa[3] = xor_block(oa[2], self.L[2]);
-                            offset = oa[3];
-                            let pt3 = _mm_loadu_si128(pt2_ptr.add(48) as *const __m128i);
-                            ta[3] = xor_block(offset, pt3);
-                            let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                            let ct3 = xor_block(ct3, oa[3]);
-                            _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                            checksum = xor_block(checksum, pt3);
-                            remaining_pt2 -= 64;
-                            k = 4;
-                            pt2_ptr = pt2_ptr.add(64);
-                            ct_ptr = ct_ptr.add(64);
-                        }
-                        if remaining_pt2 >= 32 {
-                            oa[k] = xor_block(offset, self.L[0]);
-                            let ptk0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                            ta[k] = xor_block(oa[k], ptk0);
-                            let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                            let ctk0 = xor_block(ctk0, oa[k]);
-                            _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                            checksum = xor_block(checksum, ptk0);
-                            oa[k + 1] = xor_block(oa[k], self.L[1]);
-                            offset = oa[k + 1];
-                            let ptk1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                            ta[k + 1] = xor_block(oa[k + 1], ptk1);
-                            let ctk1 = self.encrypt_key.AES_encrypt_block(ta[k + 1]);
-                            let ctk1 = xor_block(ctk1, oa[k + 1]);
-                            _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ctk1);
-                            checksum = xor_block(checksum, ptk1);
-                            remaining_pt2 -= 32;
-                            k += 2;
-                            pt2_ptr = pt2_ptr.add(32);
-                            ct_ptr = ct_ptr.add(32);
-                        }
-                        if remaining_pt2 >= 16 {
-                            oa[k] = xor_block(offset, self.L[0]);
-                            offset = oa[k];
-                            let ptk0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                            ta[k] = xor_block(offset, ptk0);
-                            let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                            let ctk0 = xor_block(ctk0, oa[k]);
-                            _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                            checksum = xor_block(checksum, ptk0);
-                            remaining_pt2 -= 16;
-                            k += 1;
-                            pt2_ptr = pt2_ptr.add(16);
-                            ct_ptr = ct_ptr.add(16);
-                        }
-                        if remaining_pt2 > 0 {
-                            let mut enc_pad = [0u8; 16];
-                            core::ptr::copy_nonoverlapping(
-                                pt2_ptr,
-                                tmp.as_mut_ptr(),
-                                remaining_pt2,
-                            );
-                            tmp[remaining_pt2] = 0x80;
-                            let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                            checksum = xor_block(checksum, pt_padded);
-                            ta[k] = xor_block(offset, self.Lstar);
-                            offset = ta[k];
-                            let pad = self.encrypt_key.AES_encrypt_block(ta[k]);
-                            _mm_storeu_si128(enc_pad.as_mut_ptr() as *mut __m128i, pad);
-                            for i in 0..remaining_pt2 {
-                                *ct_ptr.add(i) = tmp[i] ^ enc_pad[i];
-                            }
-                            ct_ptr = ct_ptr.add(remaining_pt2);
-                            k += 1;
-                            remaining_pt1 = 0;
-                            remaining_pt2 = 0;
-                        }
-                    }
-                }
-
-                if num_bpi_pt2 > 0 {
-                    oa[BPI - 1] = offset;
+            // handling pt1 to pt2 if any pt2 (rem_pt1 < 16 bytes left in pt1)
+            if rem_pt1 > 0 {
+                if num_bpi_pt2 == 0 && rem_pt2 == 0 {
+                    // entire message tail is in pt1
+                    (offset, checksum) = self.enc_tail(pt1_ptr, rem_pt1, offset, ct_ptr, checksum);
+                    ct_ptr = ct_ptr.add(rem_pt1);
+                } else if num_bpi_pt2 == 0 && rem_pt1 + rem_pt2 < 16 {
+                    // combined tail spans both buffers, still < 16 bytes
                     let mut tmp = [0u8; 16];
-                    let mut block_num = self.blocks_processed;
-                    for _ in 0..num_bpi_pt2 {
-                        block_num += BPI as u32;
-                        if BPI == 8 {
-                            oa[0] = xor_block(oa[BPI - 1], self.L[0]);
-                            let pt0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                            // Preparing inputs to the PRP
-                            ta[0] = xor_block(oa[0], pt0);
-                            let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                            let ct0 = xor_block(ct0, oa[0]);
-                            _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                            checksum = xor_block(checksum, pt0);
-                            oa[1] = xor_block(oa[0], self.L[1]);
-                            let pt1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                            ta[1] = xor_block(oa[1], pt1);
-                            let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                            let ct1 = xor_block(ct1, oa[1]);
-                            _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                            checksum = xor_block(checksum, pt1);
-                            oa[2] = xor_block(oa[1], self.L[0]);
-                            let pt2 = _mm_loadu_si128(pt2_ptr.add(32) as *const __m128i);
-                            ta[2] = xor_block(oa[2], pt2);
-                            let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                            let ct2 = xor_block(ct2, oa[2]);
-                            _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                            checksum = xor_block(checksum, pt2);
-                            oa[3] = xor_block(oa[2], self.L[2]);
-                            let pt3 = _mm_loadu_si128(pt2_ptr.add(48) as *const __m128i);
-                            ta[3] = xor_block(oa[3], pt3);
-                            let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                            let ct3 = xor_block(ct3, oa[3]);
-                            _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                            checksum = xor_block(checksum, pt3);
-                            // this allows the cpu to parallelize more efficiently, instead of using
-                            // oa[3] and L[0]; this is equivalent tho.
-                            oa[4] = xor_block(oa[1], self.L[2]);
-                            let pt4 = _mm_loadu_si128(pt2_ptr.add(64) as *const __m128i);
-                            ta[4] = xor_block(oa[4], pt4);
-                            let ct4 = self.encrypt_key.AES_encrypt_block(ta[4]);
-                            let ct4 = xor_block(ct4, oa[4]);
-                            _mm_storeu_si128(ct_ptr.add(64) as *mut __m128i, ct4);
-                            checksum = xor_block(checksum, pt4);
-                            oa[5] = xor_block(oa[0], self.L[2]);
-                            let pt5 = _mm_loadu_si128(pt2_ptr.add(80) as *const __m128i);
-                            ta[5] = xor_block(oa[5], pt5);
-                            let ct5 = self.encrypt_key.AES_encrypt_block(ta[5]);
-                            let ct5 = xor_block(ct5, oa[5]);
-                            _mm_storeu_si128(ct_ptr.add(80) as *mut __m128i, ct5);
-                            checksum = xor_block(checksum, pt5);
-                            oa[6] = xor_block(oa[7], self.L[2]);
-                            let pt6 = _mm_loadu_si128(pt2_ptr.add(96) as *const __m128i);
-                            ta[6] = xor_block(oa[6], pt6);
-                            let ct6 = self.encrypt_key.AES_encrypt_block(ta[6]);
-                            let ct6 = xor_block(ct6, oa[6]);
-                            _mm_storeu_si128(ct_ptr.add(96) as *mut __m128i, ct6);
-                            checksum = xor_block(checksum, pt6);
-                            let ntz = block_num.trailing_zeros() as usize;
-                            oa[7] = xor_block(oa[6], self.L[ntz]);
-                            let pt7 = _mm_loadu_si128(pt2_ptr.add(112) as *const __m128i);
-                            ta[7] = xor_block(oa[7], pt7);
-                            let ct7 = self.encrypt_key.AES_encrypt_block(ta[7]);
-                            let ct7 = xor_block(ct7, oa[7]);
-                            _mm_storeu_si128(ct_ptr.add(112) as *mut __m128i, ct7);
-                            checksum = xor_block(checksum, pt7);
-                        }
-
-                        pt2_ptr = pt2_ptr.add(128);
-                        ct_ptr = ct_ptr.add(128);
-                    }
-                    self.offset = oa[BPI - 1];
-                    offset = self.offset;
-                    self.blocks_processed = block_num;
-                    self.checksum = checksum;
-
-                    let mut k = 0;
-                    if remaining_pt2 >= 64 {
-                        oa[0] = xor_block(offset, self.L[0]);
-                        let pt0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                        ta[0] = xor_block(oa[0], pt0);
-                        let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                        let ct0 = xor_block(ct0, oa[0]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                        checksum = xor_block(checksum, pt0);
-                        oa[1] = xor_block(oa[0], self.L[1]);
-                        let pt1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                        ta[1] = xor_block(oa[1], pt1);
-                        let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                        let ct1 = xor_block(ct1, oa[1]);
-                        _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                        checksum = xor_block(checksum, pt1);
-                        oa[2] = xor_block(oa[1], self.L[0]);
-                        let pt2 = _mm_loadu_si128(pt2_ptr.add(32) as *const __m128i);
-                        ta[2] = xor_block(oa[2], pt2);
-                        let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                        let ct2 = xor_block(ct2, oa[2]);
-                        _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                        checksum = xor_block(checksum, pt2);
-                        oa[3] = xor_block(oa[2], self.L[2]);
-                        offset = oa[3];
-                        let pt3 = _mm_loadu_si128(pt2_ptr.add(48) as *const __m128i);
-                        ta[3] = xor_block(offset, pt3);
-                        let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                        let ct3 = xor_block(ct3, oa[3]);
-                        _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                        checksum = xor_block(checksum, pt3);
-                        remaining_pt2 -= 64;
-                        k = 4;
-                        pt2_ptr = pt2_ptr.add(64);
-                        ct_ptr = ct_ptr.add(64);
-                    }
-                    if remaining_pt2 >= 32 {
-                        oa[k] = xor_block(offset, self.L[0]);
-                        let ptk0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                        ta[k] = xor_block(oa[k], ptk0);
-                        let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        let ctk0 = xor_block(ctk0, oa[k]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                        checksum = xor_block(checksum, ptk0);
-                        oa[k + 1] = xor_block(oa[k], self.L[1]);
-                        offset = oa[k + 1];
-                        let ptk1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                        ta[k + 1] = xor_block(oa[k + 1], ptk1);
-                        let ctk1 = self.encrypt_key.AES_encrypt_block(ta[k + 1]);
-                        let ctk1 = xor_block(ctk1, oa[k + 1]);
-                        _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ctk1);
-                        checksum = xor_block(checksum, ptk1);
-                        remaining_pt2 -= 32;
-                        k += 2;
-                        pt2_ptr = pt2_ptr.add(32);
-                        ct_ptr = ct_ptr.add(32);
-                    }
-                    if remaining_pt2 >= 16 {
-                        oa[k] = xor_block(offset, self.L[0]);
-                        offset = oa[k];
-                        let ptk0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                        ta[k] = xor_block(offset, ptk0);
-                        let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        let ctk0 = xor_block(ctk0, oa[k]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                        checksum = xor_block(checksum, ptk0);
-                        remaining_pt2 -= 16;
-                        k += 1;
-                        pt2_ptr = pt2_ptr.add(16);
-                        ct_ptr = ct_ptr.add(16);
-                    }
-                    if remaining_pt2 > 0 {
-                        let mut enc_pad = [0u8; 16];
-                        core::ptr::copy_nonoverlapping(pt2_ptr, tmp.as_mut_ptr(), remaining_pt2);
-                        tmp[remaining_pt2] = 0x80;
-                        let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                        checksum = xor_block(checksum, pt_padded);
-                        ta[k] = xor_block(offset, self.Lstar);
-                        offset = ta[k];
-                        let pad = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        _mm_storeu_si128(enc_pad.as_mut_ptr() as *mut __m128i, pad);
-                        for i in 0..remaining_pt2 {
-                            *ct_ptr.add(i) = tmp[i] ^ enc_pad[i];
-                        }
-                        ct_ptr = ct_ptr.add(remaining_pt2);
-                        remaining_pt2 = 0;
-                    }
-                }
-            }
-            if remaining_pt1 > 0 && remaining_pt2 > 0 {
-                // Two plaintexts of < 128 bytes each would fall here.
-                let mut oa = [_mm_setzero_si128(); BPI];
-                let mut block_num = self.blocks_processed;
-                oa[BPI - 1] = offset;
-                let mut ta = [_mm_setzero_si128(); BPI];
-                let mut tmp = [0u8; 16];
-                let mut k = 0;
-                if remaining_pt1 >= 64 {
-                    oa[0] = xor_block(offset, self.L[0]);
-                    let pt0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                    ta[0] = xor_block(oa[0], pt0);
-                    let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                    let ct0 = xor_block(ct0, oa[0]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                    checksum = xor_block(checksum, pt0);
-                    oa[1] = xor_block(oa[0], self.L[1]);
-                    let pt1 = _mm_loadu_si128(pt1_ptr.add(16) as *const __m128i);
-                    ta[1] = xor_block(oa[1], pt1);
-                    let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                    let ct1 = xor_block(ct1, oa[1]);
-                    _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                    checksum = xor_block(checksum, pt1);
-                    oa[2] = xor_block(oa[1], self.L[0]);
-                    let pt2 = _mm_loadu_si128(pt1_ptr.add(32) as *const __m128i);
-                    ta[2] = xor_block(oa[2], pt2);
-                    let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                    let ct2 = xor_block(ct2, oa[2]);
-                    _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                    checksum = xor_block(checksum, pt2);
-                    oa[3] = xor_block(oa[2], self.L[2]);
-                    offset = oa[3];
-                    let pt3 = _mm_loadu_si128(pt1_ptr.add(48) as *const __m128i);
-                    ta[3] = xor_block(offset, pt3);
-                    let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                    let ct3 = xor_block(ct3, oa[3]);
-                    _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                    checksum = xor_block(checksum, pt3);
-                    remaining_pt1 -= 64;
-                    k = 4;
-                    pt1_ptr = pt1_ptr.add(64);
-                    ct_ptr = ct_ptr.add(64);
-                }
-                if remaining_pt1 >= 32 {
-                    oa[k] = xor_block(offset, self.L[0]);
-                    let ptk0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                    ta[k] = xor_block(oa[k], ptk0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    let ctk0 = xor_block(ctk0, oa[k]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, ptk0);
-                    oa[k + 1] = xor_block(oa[k], self.L[1]);
-                    offset = oa[k + 1];
-                    let ptk1 = _mm_loadu_si128(pt1_ptr.add(16) as *const __m128i);
-                    ta[k + 1] = xor_block(oa[k + 1], ptk1);
-                    let ctk1 = self.encrypt_key.AES_encrypt_block(ta[k + 1]);
-                    let ctk1 = xor_block(ctk1, oa[k + 1]);
-                    _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ctk1);
-                    checksum = xor_block(checksum, ptk1);
-                    remaining_pt1 -= 32;
-                    k += 2;
-                    pt1_ptr = pt1_ptr.add(32);
-                    ct_ptr = ct_ptr.add(32);
-                }
-                if remaining_pt1 >= 16 {
-                    oa[k] = xor_block(offset, self.L[0]);
-                    offset = oa[k];
-                    let ptk0 = _mm_loadu_si128(pt1_ptr as *const __m128i);
-                    ta[k] = xor_block(offset, ptk0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    let ctk0 = xor_block(ctk0, oa[k]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, ptk0);
-                    remaining_pt1 -= 16;
-                    k += 1;
-                    pt1_ptr = pt1_ptr.add(16);
-                    ct_ptr = ct_ptr.add(16);
-                }
-
-                if remaining_pt1 + remaining_pt2 == 16 {
-                    // we can reassemble then encrypt on a full block length (it should be a
-                    // rare case.
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                    core::ptr::copy_nonoverlapping(
-                        pt2_ptr,
-                        tmp.as_mut_ptr().add(remaining_pt1),
-                        remaining_pt2,
-                    );
-                    remaining_pt1 = 0;
-                    remaining_pt2 = 0;
-                    let pt0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                    oa[k] = xor_block(offset, self.L[0]);
-                    offset = oa[k];
-                    ta[k] = xor_block(offset, pt0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    let ctk0 = xor_block(ctk0, oa[k]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, pt0);
-                    ct_ptr = ct_ptr.add(16);
-                } else if remaining_pt1 + remaining_pt2 < 16 {
-                    let mut enc_pad = [0u8; 16];
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                    core::ptr::copy_nonoverlapping(
-                        pt2_ptr,
-                        tmp.as_mut_ptr().add(remaining_pt1),
-                        remaining_pt2,
-                    );
-                    tmp[remaining_pt1 + remaining_pt2] = 0x80;
-                    let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                    checksum = xor_block(checksum, pt_padded);
-                    ta[k] = xor_block(offset, self.Lstar);
-                    offset = ta[k];
-                    let pad = self.encrypt_key.AES_encrypt_block(ta[k]);
-                    _mm_storeu_si128(enc_pad.as_mut_ptr() as *mut __m128i, pad);
-                    for i in 0..remaining_pt1 + remaining_pt2 {
-                        *ct_ptr.add(i) = tmp[i] ^ enc_pad[i];
-                    }
-                    k += 1;
-                    ct_ptr = ct_ptr.add(remaining_pt1 + remaining_pt2);
-                    remaining_pt1 = 0;
-                    remaining_pt2 = 0;
+                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
+                    core::ptr::copy_nonoverlapping(pt2_ptr, tmp.as_mut_ptr().add(rem_pt1), rem_pt2);
+                    (offset, checksum) =
+                        self.enc_tail(tmp.as_ptr(), rem_pt1 + rem_pt2, offset, ct_ptr, checksum);
+                    ct_ptr = ct_ptr.add(rem_pt1 + rem_pt2);
+                    rem_pt2 = 0;
                 } else {
-                    // > 16
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), remaining_pt1);
-                    core::ptr::copy_nonoverlapping(
-                        pt2_ptr,
-                        tmp.as_mut_ptr().add(remaining_pt1),
-                        16 - remaining_pt1,
-                    );
-                    remaining_pt2 -= 16 - remaining_pt1;
-                    let pt0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                    oa[0] = xor_block(offset, self.L[0]);
-                    offset = oa[0];
-                    ta[0] = xor_block(offset, pt0);
-                    let ctk0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                    let ctk0 = xor_block(ctk0, oa[0]);
-                    _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                    checksum = xor_block(checksum, pt0);
-                    pt2_ptr = pt2_ptr.add(16 - remaining_pt1);
-                    remaining_pt1 = 0;
+                    // reassemble one full block from pt1 tail + pt2 head
+                    let need = 16 - rem_pt1;
+                    let mut tmp = [0u8; 16];
+                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
+                    core::ptr::copy_nonoverlapping(pt2_ptr, tmp.as_mut_ptr().add(rem_pt1), need);
+                    if rem_pt2 < need {
+                        num_bpi_pt2 -= 1;
+                        rem_pt2 = BPI * 16 - need + rem_pt2;
+                    } else {
+                        rem_pt2 -= need;
+                    }
+                    pt2_ptr = pt2_ptr.add(need);
+
+                    let l0 = self.L[0];
+                    (offset, checksum) = self.enc_block(offset, l0, tmp.as_ptr(), ct_ptr, checksum);
                     ct_ptr = ct_ptr.add(16);
-                    k = 0;
-                    if remaining_pt2 >= 64 {
-                        oa[0] = xor_block(offset, self.L[0]);
-                        let pt0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                        ta[0] = xor_block(oa[0], pt0);
-                        let ct0 = self.encrypt_key.AES_encrypt_block(ta[0]);
-                        let ct0 = xor_block(ct0, oa[0]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ct0);
-                        checksum = xor_block(checksum, pt0);
-                        oa[1] = xor_block(oa[0], self.L[1]);
-                        let pt1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                        ta[1] = xor_block(oa[1], pt1);
-                        let ct1 = self.encrypt_key.AES_encrypt_block(ta[1]);
-                        let ct1 = xor_block(ct1, oa[1]);
-                        _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ct1);
-                        checksum = xor_block(checksum, pt1);
-                        oa[2] = xor_block(oa[1], self.L[0]);
-                        let pt2 = _mm_loadu_si128(pt2_ptr.add(32) as *const __m128i);
-                        ta[2] = xor_block(oa[2], pt2);
-                        let ct2 = self.encrypt_key.AES_encrypt_block(ta[2]);
-                        let ct2 = xor_block(ct2, oa[2]);
-                        _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, ct2);
-                        checksum = xor_block(checksum, pt2);
-                        oa[3] = xor_block(oa[2], self.L[2]);
-                        offset = oa[3];
-                        let pt3 = _mm_loadu_si128(pt2_ptr.add(48) as *const __m128i);
-                        ta[3] = xor_block(offset, pt3);
-                        let ct3 = self.encrypt_key.AES_encrypt_block(ta[3]);
-                        let ct3 = xor_block(ct3, oa[3]);
-                        _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, ct3);
-                        checksum = xor_block(checksum, pt3);
-                        remaining_pt2 -= 64;
-                        k = 4;
-                        pt2_ptr = pt2_ptr.add(64);
-                        ct_ptr = ct_ptr.add(64);
-                    }
-                    if remaining_pt2 >= 32 {
-                        oa[k] = xor_block(offset, self.L[0]);
-                        let ptk0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                        ta[k] = xor_block(oa[k], ptk0);
-                        let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        let ctk0 = xor_block(ctk0, oa[k]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                        checksum = xor_block(checksum, ptk0);
-                        oa[k + 1] = xor_block(oa[k], self.L[1]);
-                        offset = oa[k + 1];
-                        let ptk1 = _mm_loadu_si128(pt2_ptr.add(16) as *const __m128i);
-                        ta[k + 1] = xor_block(oa[k + 1], ptk1);
-                        let ctk1 = self.encrypt_key.AES_encrypt_block(ta[k + 1]);
-                        let ctk1 = xor_block(ctk1, oa[k + 1]);
-                        _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, ctk1);
-                        checksum = xor_block(checksum, ptk1);
-                        remaining_pt2 -= 32;
-                        k += 2;
-                        pt2_ptr = pt2_ptr.add(32);
-                        ct_ptr = ct_ptr.add(32);
-                    }
-                    if remaining_pt2 >= 16 {
-                        oa[k] = xor_block(offset, self.L[0]);
-                        offset = oa[k];
-                        let ptk0 = _mm_loadu_si128(pt2_ptr as *const __m128i);
-                        ta[k] = xor_block(offset, ptk0);
-                        let ctk0 = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        let ctk0 = xor_block(ctk0, oa[k]);
-                        _mm_storeu_si128(ct_ptr as *mut __m128i, ctk0);
-                        checksum = xor_block(checksum, ptk0);
-                        remaining_pt2 -= 16;
-                        k += 1;
-                        pt2_ptr = pt2_ptr.add(16);
-                        ct_ptr = ct_ptr.add(16);
-                    }
-                    if remaining_pt2 > 0 {
-                        let mut enc_pad = [0u8; 16];
-                        core::ptr::copy_nonoverlapping(pt2_ptr, tmp.as_mut_ptr(), remaining_pt2);
-                        tmp[remaining_pt2] = 0x80;
-                        let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                        checksum = xor_block(checksum, pt_padded);
-                        ta[k] = xor_block(offset, self.Lstar);
-                        offset = ta[k];
-                        let pad = self.encrypt_key.AES_encrypt_block(ta[k]);
-                        _mm_storeu_si128(enc_pad.as_mut_ptr() as *mut __m128i, pad);
-                        for i in 0..remaining_pt2 {
-                            *ct_ptr.add(i) = tmp[i] ^ enc_pad[i];
-                        }
-                        ct_ptr = ct_ptr.add(remaining_pt2);
-                        k += 1;
-                        remaining_pt1 = 0;
-                        remaining_pt2 = 0;
-                    }
                 }
+                rem_pt1 = 0;
             }
 
-            if remaining_pt1 > 0 {
-                let mut tmp = [0u8; 16];
+            // full BPI groups from pt2
+            for _ in 0..num_bpi_pt2 {
+                (offset, checksum, block_num) =
+                    self.enc_bpi(offset, pt2_ptr, ct_ptr, block_num, checksum);
+                pt2_ptr = pt2_ptr.add(BPI * 16);
+                ct_ptr = ct_ptr.add(BPI * 16);
             }
 
-            if remaining_pt2 > 0 {
-                let mut tmp = [0u8; 16];
+            // full blocks from pt2 remainder
+            if rem_pt2 >= 16 {
+                (offset, checksum, pt2_ptr, ct_ptr, rem_pt2) =
+                    self.enc_full_blocks(offset, pt2_ptr, ct_ptr, rem_pt2, checksum);
             }
+
+            // pt2 tail
+            if rem_pt2 > 0 {
+                (offset, checksum) = self.enc_tail(pt2_ptr, rem_pt2, offset, ct_ptr, checksum);
+                ct_ptr = ct_ptr.add(rem_pt2);
+            }
+
+            self.offset = offset;
+            self.checksum = checksum;
+            self.blocks_processed = block_num;
         }
         Ok(())
     }
