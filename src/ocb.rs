@@ -24,7 +24,6 @@ struct AEctx {
     encrypt_key: AesKey,
     KtopStr: [u64; 3],
     ad_blocks_processed: u32,
-    blocks_processed: u32,
 }
 
 impl AEctx {
@@ -44,7 +43,6 @@ impl AEctx {
                 encrypt_key: AesKey::default(),
                 KtopStr: [0u64; 3],
                 ad_blocks_processed: 0,
-                blocks_processed: 0,
             }
         };
 
@@ -91,130 +89,135 @@ impl AEctx {
     fn process_ad(&mut self, ad: &[u8]) {}
 
     /// Encrypts one 16-byte block
-    /// Returns (oa, new_checksum).
+    /// Returns oa (the block offset) and updates self.offset and self.checksum.
     #[inline(always)]
     unsafe fn enc_block(
         &mut self,
-        offset: __m128i,
         l: __m128i,
         pt_ptr: *const u8,
         ct_ptr: *mut u8,
-        checksum: __m128i,
-    ) -> (__m128i, __m128i) {
-        let oa = xor_block(offset, l);
+    ) -> __m128i {
+        let oa = xor_block(self.offset, l);
         let pt = _mm_loadu_si128(pt_ptr as *const __m128i);
         let t = xor_block(oa, pt);
         let ct = self.encrypt_key.AES_encrypt_block(t);
         _mm_storeu_si128(ct_ptr as *mut __m128i, xor_block(ct, oa));
-        (oa, xor_block(checksum, pt))
+        self.checksum = xor_block(self.checksum, pt);
+        self.offset = oa;
+        oa
+    }
+
+    /// Encrypts a single block at `pt_ptr`, incrementing `block_num` and using `L[ntz(block_num)]`.
+    #[inline(always)]
+    unsafe fn enc_single_block(
+        &mut self,
+        pt_ptr: *const u8,
+        ct_ptr: *mut u8,
+        block_num: &mut u32,
+    ) {
+        *block_num += 1;
+        let ntz = block_num.trailing_zeros() as usize;
+        self.enc_block(self.L[ntz], pt_ptr, ct_ptr);
     }
 
     /// Encrypts a full BPI (8-block) group using the algebraic offset shortcut.
-    /// `block_num` is the block count **before** this group.
-    /// Returns `(new_offset, new_checksum, new_block_num)`.
+    /// `block_num` is the block count **before** this group and MUST be a multiple of 8.
+    /// Returns the updated `block_num`.
     #[inline(always)]
     unsafe fn enc_bpi(
         &mut self,
-        offset: __m128i,
         pt_ptr: *const u8,
         ct_ptr: *mut u8,
         block_num: u32,
-        checksum: __m128i,
-    ) -> (__m128i, __m128i, u32) {
+    ) -> u32 {
+        debug_assert_eq!(block_num % 8, 0);
         let block_num = block_num + BPI as u32;
         let l0 = self.L[0];
         let l1 = self.L[1];
         let l2 = self.L[2];
-        let cs = checksum;
+        let offset = self.offset;
 
-        let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
-        let (oa1, cs) = self.enc_block(oa0, l1, pt_ptr.add(16), ct_ptr.add(16), cs);
-        let (oa2, cs) = self.enc_block(oa1, l0, pt_ptr.add(32), ct_ptr.add(32), cs);
-        let (_oa3, cs) = self.enc_block(oa2, l2, pt_ptr.add(48), ct_ptr.add(48), cs);
-        // algebraic shortcuts — shorter dependency chains for OoO execution
-        let (_oa4, cs) = self.enc_block(oa1, l2, pt_ptr.add(64), ct_ptr.add(64), cs);
-        let (_oa5, cs) = self.enc_block(oa0, l2, pt_ptr.add(80), ct_ptr.add(80), cs);
-        let (oa6, cs) = self.enc_block(offset, l2, pt_ptr.add(96), ct_ptr.add(96), cs);
+        let oa0 = self.enc_block(l0, pt_ptr, ct_ptr);
+        let oa1 = self.enc_block(l1, pt_ptr.add(16), ct_ptr.add(16));
+        let _ = self.enc_block(l0, pt_ptr.add(32), ct_ptr.add(32));
+        let _ = self.enc_block(l2, pt_ptr.add(48), ct_ptr.add(48));
+        // algebraic shortcuts — valid only when starting at a multiple-of-8 boundary
+        self.offset = oa1;
+        let _ = self.enc_block(l2, pt_ptr.add(64), ct_ptr.add(64));
+        self.offset = oa0;
+        let _ = self.enc_block(l2, pt_ptr.add(80), ct_ptr.add(80));
+        self.offset = offset;
+        let oa6 = self.enc_block(l2, pt_ptr.add(96), ct_ptr.add(96));
         let ntz = block_num.trailing_zeros() as usize;
-        let (oa7, cs) = self.enc_block(oa6, self.L[ntz], pt_ptr.add(112), ct_ptr.add(112), cs);
+        self.offset = oa6;
+        let _ = self.enc_block(self.L[ntz], pt_ptr.add(112), ct_ptr.add(112));
 
-        (oa7, cs, block_num)
+        block_num
     }
 
-    /// Encrypts full 16-byte blocks from the front of `remaining` bytes
-    /// Returns `(new_offset, new_checksum, new_pt_ptr, new_ct_ptr, new_remaining)`.
+    /// Encrypts contiguous full blocks from `pt_ptr` into `ct_ptr`.
+    /// First aligns to an 8-block boundary, then processes full BPI groups,
+    /// then finishes any remaining full blocks.
     #[inline(always)]
-    unsafe fn enc_full_blocks(
+    unsafe fn enc_contiguous(
         &mut self,
-        mut offset: __m128i,
         mut pt_ptr: *const u8,
         mut ct_ptr: *mut u8,
-        mut remaining: usize,
-        checksum: __m128i,
-    ) -> (__m128i, __m128i, *const u8, *mut u8, usize) {
-        let l0 = self.L[0];
-        let l1 = self.L[1];
-        let l2 = self.L[2];
-        let cs = checksum;
-
-        if remaining >= 64 {
-            let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
-            let (oa1, cs) = self.enc_block(oa0, l1, pt_ptr.add(16), ct_ptr.add(16), cs);
-            let (oa2, cs) = self.enc_block(oa1, l0, pt_ptr.add(32), ct_ptr.add(32), cs);
-            let (oa3, cs) = self.enc_block(oa2, l2, pt_ptr.add(48), ct_ptr.add(48), cs);
-            offset = oa3;
-            remaining -= 64;
-            pt_ptr = pt_ptr.add(64);
-            ct_ptr = ct_ptr.add(64);
-        }
-        if remaining >= 32 {
-            let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
-            let (oa1, cs) = self.enc_block(oa0, l1, pt_ptr.add(16), ct_ptr.add(16), cs);
-            offset = oa1;
-            remaining -= 32;
-            pt_ptr = pt_ptr.add(32);
-            ct_ptr = ct_ptr.add(32);
-        }
-        if remaining >= 16 {
-            let (oa0, cs) = self.enc_block(offset, l0, pt_ptr, ct_ptr, cs);
-            offset = oa0;
-            remaining -= 16;
+        mut full_blocks: usize,
+        block_num: &mut u32,
+    ) -> (*const u8, *mut u8) {
+        // Align to an 8-block boundary so enc_bpi can be safely used
+        while !(*block_num).is_multiple_of(8) && full_blocks > 0 {
+            self.enc_single_block(pt_ptr, ct_ptr, block_num);
             pt_ptr = pt_ptr.add(16);
             ct_ptr = ct_ptr.add(16);
+            full_blocks -= 1;
         }
-        (offset, cs, pt_ptr, ct_ptr, remaining)
+
+        // Process aligned full BPI groups using the original implementation algebraic shortcut
+        let num_bpi = full_blocks / BPI;
+        for _ in 0..num_bpi {
+            *block_num = self.enc_bpi(pt_ptr, ct_ptr, *block_num);
+            pt_ptr = pt_ptr.add(BPI * 16);
+            ct_ptr = ct_ptr.add(BPI * 16);
+        }
+        full_blocks %= BPI;
+
+        // Process remaining full blocks (< 8)
+        while full_blocks > 0 {
+            self.enc_single_block(pt_ptr, ct_ptr, block_num);
+            pt_ptr = pt_ptr.add(16);
+            ct_ptr = ct_ptr.add(16);
+            full_blocks -= 1;
+        }
+
+        (pt_ptr, ct_ptr)
     }
 
     /// Encrypts the final partial block (`len < 16`) with `0x80` padding and L*.
-    /// Returns `(new_offset, new_checksum)`.
     #[inline(always)]
     unsafe fn enc_tail(
         &mut self,
         data_ptr: *const u8,
         data_len: usize,
-        offset: __m128i,
         ct_ptr: *mut u8,
-        checksum: __m128i,
-    ) -> (__m128i, __m128i) {
+    ) {
         let mut tmp = [0u8; 16];
         core::ptr::copy_nonoverlapping(data_ptr, tmp.as_mut_ptr(), data_len);
         tmp[data_len] = 0x80;
         let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-        let cs = xor_block(checksum, pt_padded);
-        let t = xor_block(offset, self.Lstar);
+        self.checksum = xor_block(self.checksum, pt_padded);
+        let t = xor_block(self.offset, self.Lstar);
         let pad = self.encrypt_key.AES_encrypt_block(t);
         let mut pad_bytes = [0u8; 16];
         _mm_storeu_si128(pad_bytes.as_mut_ptr() as *mut __m128i, pad);
         for i in 0..data_len {
             *ct_ptr.add(i) = tmp[i] ^ pad_bytes[i];
         }
-        (t, cs)
+        self.offset = t;
     }
 
-    // ---------------------------------------------------------------------
-    //  Main encryption
-    // ---------------------------------------------------------------------
-
+    /// Todo
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
         self.offset = self.gen_offset_from_nonce(nonce);
@@ -226,124 +229,102 @@ impl AEctx {
             self.process_ad(ad);
         }
 
-        let (
-            mut pt1_ptr,
-            mut pt2_ptr,
-            mut ct_ptr,
-            num_bpi_pt1,
-            mut rem_pt1,
-            mut num_bpi_pt2,
-            mut rem_pt2,
-        ) = match io {
-            EncryptIO::InPlace(buf) => (
-                buf.as_ptr(),
-                std::ptr::null(),
-                buf.as_mut_ptr(),
-                buf.len() / (BPI * 16),
-                buf.len() % (BPI * 16),
-                0,
-                0,
-            ),
-            EncryptIO::OutOfPlace { in_pt, out } => match in_pt {
-                PlainText::Contiguous(pt) => (
-                    pt.as_ptr(),
-                    std::ptr::null(),
-                    out.as_mut_ptr(),
-                    pt.len() / (BPI * 16),
-                    pt.len() % (BPI * 16),
-                    0,
-                    0,
-                ),
-                PlainText::Scattered(pt1, pt2) => (
-                    pt1.as_ptr(),
-                    pt2.as_ptr(),
-                    out.as_mut_ptr(),
-                    pt1.len() / (BPI * 16),
-                    pt1.len() % (BPI * 16),
-                    pt2.len() / (BPI * 16),
-                    pt2.len() % (BPI * 16),
-                ),
-            },
-        };
-
         unsafe {
-            let mut offset = self.offset;
-            let mut checksum = self.checksum;
-            let mut block_num = self.blocks_processed;
+            let mut block_num = 0u32;
 
-            // full BPI groups from pt1
-            for _ in 0..num_bpi_pt1 {
-                (offset, checksum, block_num) =
-                    self.enc_bpi(offset, pt1_ptr, ct_ptr, block_num, checksum);
-                pt1_ptr = pt1_ptr.add(BPI * 16);
-                ct_ptr = ct_ptr.add(BPI * 16);
-            }
+            match io {
+                EncryptIO::InPlace(buf) => {
+                    let mut pt_ptr = buf.as_ptr();
+                    let mut ct_ptr = buf.as_mut_ptr();
+                    let full_blocks = buf.len() / 16;
+                    let rem = buf.len() % 16;
 
-            // full blocks from pt1 remainder
-            if rem_pt1 >= 16 {
-                (offset, checksum, pt1_ptr, ct_ptr, rem_pt1) =
-                    self.enc_full_blocks(offset, pt1_ptr, ct_ptr, rem_pt1, checksum);
-            }
-
-            // handling pt1 to pt2 if any pt2 (rem_pt1 < 16 bytes left in pt1)
-            if rem_pt1 > 0 {
-                if num_bpi_pt2 == 0 && rem_pt2 == 0 {
-                    // entire message tail is in pt1
-                    (offset, checksum) = self.enc_tail(pt1_ptr, rem_pt1, offset, ct_ptr, checksum);
-                    ct_ptr = ct_ptr.add(rem_pt1);
-                } else if num_bpi_pt2 == 0 && rem_pt1 + rem_pt2 < 16 {
-                    // combined tail spans both buffers, still < 16 bytes
-                    let mut tmp = [0u8; 16];
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
-                    core::ptr::copy_nonoverlapping(pt2_ptr, tmp.as_mut_ptr().add(rem_pt1), rem_pt2);
-                    (offset, checksum) =
-                        self.enc_tail(tmp.as_ptr(), rem_pt1 + rem_pt2, offset, ct_ptr, checksum);
-                    ct_ptr = ct_ptr.add(rem_pt1 + rem_pt2);
-                    rem_pt2 = 0;
-                } else {
-                    // reassemble one full block from pt1 tail + pt2 head
-                    let need = 16 - rem_pt1;
-                    let mut tmp = [0u8; 16];
-                    core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
-                    core::ptr::copy_nonoverlapping(pt2_ptr, tmp.as_mut_ptr().add(rem_pt1), need);
-                    if rem_pt2 < need {
-                        num_bpi_pt2 -= 1;
-                        rem_pt2 = BPI * 16 - need + rem_pt2;
-                    } else {
-                        rem_pt2 -= need;
+                    (pt_ptr, ct_ptr) =
+                        self.enc_contiguous(pt_ptr, ct_ptr, full_blocks, &mut block_num);
+                    if rem > 0 {
+                        self.enc_tail(pt_ptr, rem, ct_ptr);
                     }
-                    pt2_ptr = pt2_ptr.add(need);
-
-                    let l0 = self.L[0];
-                    (offset, checksum) = self.enc_block(offset, l0, tmp.as_ptr(), ct_ptr, checksum);
-                    ct_ptr = ct_ptr.add(16);
                 }
-                rem_pt1 = 0;
-            }
+                EncryptIO::OutOfPlace { in_pt, out } => match in_pt {
+                    PlainText::Contiguous(pt) => {
+                        let mut pt_ptr = pt.as_ptr();
+                        let mut ct_ptr = out.as_mut_ptr();
+                        let full_blocks = pt.len() / 16;
+                        let rem = pt.len() % 16;
 
-            // full BPI groups from pt2
-            for _ in 0..num_bpi_pt2 {
-                (offset, checksum, block_num) =
-                    self.enc_bpi(offset, pt2_ptr, ct_ptr, block_num, checksum);
-                pt2_ptr = pt2_ptr.add(BPI * 16);
-                ct_ptr = ct_ptr.add(BPI * 16);
-            }
+                        (pt_ptr, ct_ptr) =
+                            self.enc_contiguous(pt_ptr, ct_ptr, full_blocks, &mut block_num);
+                        if rem > 0 {
+                            self.enc_tail(pt_ptr, rem, ct_ptr);
+                        }
+                    }
+                    PlainText::Scattered(pt1, pt2) => {
+                        let mut pt1_ptr = pt1.as_ptr();
+                        let mut pt2_ptr = pt2.as_ptr();
+                        let mut ct_ptr = out.as_mut_ptr();
 
-            // full blocks from pt2 remainder
-            if rem_pt2 >= 16 {
-                (offset, checksum, pt2_ptr, ct_ptr, rem_pt2) =
-                    self.enc_full_blocks(offset, pt2_ptr, ct_ptr, rem_pt2, checksum);
-            }
+                        let full_blocks_pt1 = pt1.len() / 16;
+                        let rem_pt1 = pt1.len() % 16;
 
-            // pt2 tail
-            if rem_pt2 > 0 {
-                (offset, checksum) = self.enc_tail(pt2_ptr, rem_pt2, offset, ct_ptr, checksum);
-                ct_ptr = ct_ptr.add(rem_pt2);
-            }
+                        (pt1_ptr, ct_ptr) =
+                            self.enc_contiguous(pt1_ptr, ct_ptr, full_blocks_pt1, &mut block_num);
 
-            self.offset = offset;
-            self.checksum = checksum;
-            self.blocks_processed = block_num;
+                        if rem_pt1 > 0 {
+                            if pt2.is_empty() {
+                                self.enc_tail(pt1_ptr, rem_pt1, ct_ptr);
+                            } else if rem_pt1 + pt2.len() < 16 {
+                                let total_tail = rem_pt1 + pt2.len();
+                                let mut tmp = [0u8; 16];
+                                core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
+                                core::ptr::copy_nonoverlapping(
+                                    pt2_ptr,
+                                    tmp.as_mut_ptr().add(rem_pt1),
+                                    pt2.len(),
+                                );
+                                self.enc_tail(tmp.as_ptr(), total_tail, ct_ptr);
+                            } else {
+                                // Reassemble one full block from pt1 tail + pt2 head
+                                let need = 16 - rem_pt1;
+                                let mut tmp = [0u8; 16];
+                                core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
+                                core::ptr::copy_nonoverlapping(
+                                    pt2_ptr,
+                                    tmp.as_mut_ptr().add(rem_pt1),
+                                    need,
+                                );
+
+                                self.enc_single_block(tmp.as_ptr(), ct_ptr, &mut block_num);
+                                ct_ptr = ct_ptr.add(16);
+                                pt2_ptr = pt2_ptr.add(need);
+
+                                let remaining_pt2 = pt2.len() - need;
+                                let full_blocks_pt2 = remaining_pt2 / 16;
+                                let rem_pt2 = remaining_pt2 % 16;
+
+                                (pt2_ptr, ct_ptr) = self.enc_contiguous(
+                                    pt2_ptr,
+                                    ct_ptr,
+                                    full_blocks_pt2,
+                                    &mut block_num,
+                                );
+                                if rem_pt2 > 0 {
+                                    self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
+                                }
+                            }
+                        } else {
+                            // rem_pt1 == 0, pt2 continues directly
+                            let full_blocks_pt2 = pt2.len() / 16;
+                            let rem_pt2 = pt2.len() % 16;
+
+                            (pt2_ptr, ct_ptr) =
+                                self.enc_contiguous(pt2_ptr, ct_ptr, full_blocks_pt2, &mut block_num);
+                            if rem_pt2 > 0 {
+                                self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
+                            }
+                        }
+                    }
+                },
+            }
         }
         Ok(())
     }
