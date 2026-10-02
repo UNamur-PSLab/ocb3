@@ -5,6 +5,7 @@ use crate::Result;
 use crate::aes::AesKey;
 use crate::sse::*;
 use core::arch::x86_64::*;
+use std::num;
 
 // Note: this code cannot process ciphertext or plaintext larger than 2^20
 const L_TABLE_SZ: usize = 16;
@@ -23,7 +24,6 @@ struct AEctx {
     decrypt_key: AesKey,
     encrypt_key: AesKey,
     KtopStr: [u64; 3],
-    ad_blocks_processed: u32,
 }
 
 impl AEctx {
@@ -42,7 +42,6 @@ impl AEctx {
                 decrypt_key: AesKey::default(),
                 encrypt_key: AesKey::default(),
                 KtopStr: [0u64; 3],
-                ad_blocks_processed: 0,
             }
         };
 
@@ -86,7 +85,45 @@ impl AEctx {
     }
 
     #[inline(always)]
-    fn process_ad(&mut self, ad: &[u8]) {}
+    fn process_ad(&mut self, ad: &[u8]) {
+        let num_bpi = ad.len() / (BPI * 16);
+        let mut ad_blocks_num: usize = 0;
+        let l0 = self.L[0];
+        let l1 = self.L[1];
+        let l2 = self.L[2];
+        unsafe {
+            for _ in 0..num_bpi {
+                ad_blocks_num += BPI;
+                let tz = ad_blocks_num.trailing_zeros() as usize;
+                let oa = xor_block(self.ad_offset, l0);
+                let ad0 = _mm_loadu_si128(ad.as_ptr() as *const __m128i);
+                let ta = xor_block(oa, ad0);
+                let ct = self.encrypt_key.AES_encrypt_block(ta);
+                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                let oa1 = xor_block(oa, l1);
+                let ad1 = _mm_loadu_si128(ad.as_ptr().add(16) as *const __m128i);
+                let ta1 = xor_block(oa1, ad1);
+                let ct = self.encrypt_key.AES_encrypt_block(ta1);
+                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                let oa2 = xor_block(self.ad_offset, l1);
+                let ad2 = _mm_loadu_si128(ad.as_ptr().add(32) as *const __m128i);
+                let ta2 = xor_block(oa2, ad2);
+                let ct = self.encrypt_key.AES_encrypt_block(ta2);
+                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                let oa3 = xor_block(oa2, l2);
+                let ad3 = _mm_loadu_si128(ad.as_ptr().add(48) as *const __m128i);
+                let ta3 = xor_block(oa3, ad3);
+                let ct = self.encrypt_key.AES_encrypt_block(ta3);
+                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                let oa4 = xor_block(oa1, l2);
+                let ad4 = _mm_loadu_si128(ad.as_ptr().add(64) as *const __m128i);
+                let ta4 = xor_block(oa4, ad4);
+                let ct = self.encrypt_key.AES_encrypt_block(ta4);
+                self.ad_checksum = xor_block(self.ad_checksum, ct);
+
+            }
+        }
+    }
 
     /// Encrypts one 16-byte block
     /// Returns oa (the block offset) and updates self.offset and self.checksum.
@@ -216,6 +253,19 @@ impl AEctx {
         }
         self.offset = t;
     }
+    
+    /// Compute and store the final tag
+    #[inline(always)]
+    unsafe fn compute_and_store_tag(
+        &mut self, 
+        ct_ptr: *mut u8,
+    ) {
+        self.offset = xor_block(self.offset, self.Ldollar);
+        let ta = xor_block(self.offset, self.checksum);
+        let ct = self.encrypt_key.AES_encrypt_block(ta);
+        self.offset = xor_block(ct, self.ad_checksum);
+        _mm_storeu_si128(ct_ptr as *mut __m128i, self.offset);
+    }
 
     /// Todo
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
@@ -244,6 +294,7 @@ impl AEctx {
                     if rem > 0 {
                         self.enc_tail(pt_ptr, rem, ct_ptr);
                     }
+                    self.compute_and_store_tag(ct_ptr);
                 }
                 EncryptIO::OutOfPlace { in_pt, out } => match in_pt {
                     PlainText::Contiguous(pt) => {
@@ -257,6 +308,7 @@ impl AEctx {
                         if rem > 0 {
                             self.enc_tail(pt_ptr, rem, ct_ptr);
                         }
+                        self.compute_and_store_tag(ct_ptr);
                     }
                     PlainText::Scattered(pt1, pt2) => {
                         let mut pt1_ptr = pt1.as_ptr();
@@ -322,9 +374,11 @@ impl AEctx {
                                 self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
                             }
                         }
+                        self.compute_and_store_tag(ct_ptr);
                     }
                 },
             }
+
         }
         Ok(())
     }
