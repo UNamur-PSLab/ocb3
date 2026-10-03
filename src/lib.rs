@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+// Note: this code cannot process ciphertext or plaintext larger than 2^20 - 128
+pub const MAX_PT_SIZE: usize = 1048448;
 pub const OCB_KEY_LEN: u8 = 16;
 pub const OCB_TAG_LEN: u8 = 16;
 pub type Result<T> = std::result::Result<T, CryptoError>;
@@ -14,6 +16,7 @@ pub enum PlainText<'a> {
 /// An encryption can either be in place or out of place. In the case of out of place encryption
 /// we may as well have scattered plaintext.
 pub enum EncryptIO<'a> {
+    /// Encrypts up to .len() - OCB_TAG_LEN
     InPlace(&'a mut [u8]),
     OutOfPlace {
         in_pt: PlainText<'a>,
@@ -35,10 +38,18 @@ impl<'a> EncryptIO<'a> {
     /// The destination must be larger or equal size than the plaintext buffer.
     #[inline]
     pub fn validate(&self) -> Result<()> {
+        if self.len() > MAX_PT_SIZE {
+            return Err(CryptoError::PlaintextTooLong);
+        }
         match self {
-            Self::InPlace(_) => Ok(()),
+            Self::InPlace(in_pt) => {
+                if in_pt.len() < OCB_TAG_LEN as usize {
+                    return Err(CryptoError::DestinationUnfit);
+                }
+                Ok(())
+            }
             Self::OutOfPlace { in_pt, out } => {
-                if in_pt.len() > out.len() {
+                if in_pt.len() + OCB_TAG_LEN as usize > out.len() {
                     return Err(CryptoError::DestinationUnfit);
                 }
                 Ok(())
@@ -57,7 +68,11 @@ impl<'a> EncryptIO<'a> {
 
 #[derive(Error, Debug)]
 pub enum CryptoError {
-    #[error("")]
+    #[error("Plaintext cannot be longer than {MAX_PT_SIZE} bytes")]
+    PlaintextTooLong,
+    #[error(
+        "The size of the destination buffer does fit. It needs to be sufficient to hold the size of the plaintext plus the size of tag"
+    )]
     DestinationUnfit,
     #[error("Bad tag observed during decryption")]
     TagInvalid,

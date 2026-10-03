@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::EncryptIO;
+use crate::OCB_TAG_LEN;
 use crate::PlainText;
 use crate::Result;
 use crate::aes::AesKey;
@@ -8,7 +9,6 @@ use core::arch::x86_64::*;
 use std::env::consts;
 use std::num;
 
-// Note: this code cannot process ciphertext or plaintext larger than 2^20
 const L_TABLE_SZ: usize = 16;
 const BPI: usize = 8;
 
@@ -56,7 +56,7 @@ impl AEctx {
         tmp_blk = double(tmp_blk);
         ctx.L[0] = swap_if_le(tmp_blk);
 
-        for i in 0..L_TABLE_SZ {
+        for i in 1..L_TABLE_SZ {
             tmp_blk = double(tmp_blk);
             ctx.L[i] = swap_if_le(tmp_blk);
         }
@@ -296,8 +296,14 @@ impl AEctx {
     }
 
     /// Encrypts the final partial block (`len < 16`) with `0x80` padding and L*.
+    /// Returns the `ct_ptr` advanced past the written ciphertext.
     #[inline(always)]
-    unsafe fn enc_tail(&mut self, data_ptr: *const u8, data_len: usize, ct_ptr: *mut u8) {
+    unsafe fn enc_tail(
+        &mut self,
+        data_ptr: *const u8,
+        data_len: usize,
+        ct_ptr: *mut u8,
+    ) -> *mut u8 {
         let mut tmp = [0u8; 16];
         core::ptr::copy_nonoverlapping(data_ptr, tmp.as_mut_ptr(), data_len);
         tmp[data_len] = 0x80;
@@ -311,6 +317,7 @@ impl AEctx {
             *ct_ptr.add(i) = tmp[i] ^ pad_bytes[i];
         }
         self.offset = t;
+        ct_ptr.add(data_len)
     }
 
     /// Compute and store the final tag
@@ -329,6 +336,7 @@ impl AEctx {
         self.offset = self.gen_offset_from_nonce(nonce);
         unsafe {
             self.ad_offset = _mm_setzero_si128();
+            self.ad_checksum = _mm_setzero_si128();
             self.checksum = _mm_setzero_si128();
         }
         if !ad.is_empty() {
@@ -340,15 +348,17 @@ impl AEctx {
 
             match io {
                 EncryptIO::InPlace(buf) => {
+                    // The buffer holds the plaintext followed by a 16-byte tag slot.
+                    let pt_len = buf.len() - OCB_TAG_LEN as usize;
                     let mut pt_ptr = buf.as_ptr();
                     let mut ct_ptr = buf.as_mut_ptr();
-                    let full_blocks = buf.len() / 16;
-                    let rem = buf.len() % 16;
+                    let full_blocks = pt_len / 16;
+                    let rem = pt_len % 16;
 
                     (pt_ptr, ct_ptr) =
                         self.enc_contiguous(pt_ptr, ct_ptr, full_blocks, &mut block_num);
                     if rem > 0 {
-                        self.enc_tail(pt_ptr, rem, ct_ptr);
+                        ct_ptr = self.enc_tail(pt_ptr, rem, ct_ptr);
                     }
                     self.compute_and_store_tag(ct_ptr);
                 }
@@ -362,7 +372,7 @@ impl AEctx {
                         (pt_ptr, ct_ptr) =
                             self.enc_contiguous(pt_ptr, ct_ptr, full_blocks, &mut block_num);
                         if rem > 0 {
-                            self.enc_tail(pt_ptr, rem, ct_ptr);
+                            ct_ptr = self.enc_tail(pt_ptr, rem, ct_ptr);
                         }
                         self.compute_and_store_tag(ct_ptr);
                     }
@@ -379,7 +389,7 @@ impl AEctx {
 
                         if rem_pt1 > 0 {
                             if pt2.is_empty() {
-                                self.enc_tail(pt1_ptr, rem_pt1, ct_ptr);
+                                ct_ptr = self.enc_tail(pt1_ptr, rem_pt1, ct_ptr);
                             } else if rem_pt1 + pt2.len() < 16 {
                                 let total_tail = rem_pt1 + pt2.len();
                                 let mut tmp = [0u8; 16];
@@ -389,7 +399,7 @@ impl AEctx {
                                     tmp.as_mut_ptr().add(rem_pt1),
                                     pt2.len(),
                                 );
-                                self.enc_tail(tmp.as_ptr(), total_tail, ct_ptr);
+                                ct_ptr = self.enc_tail(tmp.as_ptr(), total_tail, ct_ptr);
                             } else {
                                 // Reassemble one full block from pt1 tail + pt2 head
                                 let need = 16 - rem_pt1;
@@ -416,7 +426,7 @@ impl AEctx {
                                     &mut block_num,
                                 );
                                 if rem_pt2 > 0 {
-                                    self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
+                                    ct_ptr = self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
                                 }
                             }
                         } else {
@@ -431,7 +441,7 @@ impl AEctx {
                                 &mut block_num,
                             );
                             if rem_pt2 > 0 {
-                                self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
+                                ct_ptr = self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
                             }
                         }
                         self.compute_and_store_tag(ct_ptr);
@@ -440,5 +450,359 @@ impl AEctx {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EncryptIO, PlainText};
+    // Note:
+    // These tests were generated using Qwen-3.8-27B on local hardware, feeding the LLM
+    // with the output test vectors of the original C implementation, and asking it to exercice
+    // our InPlace/OutOfPLace and Scattered API on the test vectors.
+
+    /// OCB3 spec test key and nonce (AES-128, 128-bit tag).
+    const SPEC_KEY: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    const SPEC_NONCE: [u8; 12] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    ];
+
+    /// Official OCB3 test vectors: (pt_len, ad_len, expected ct, expected tag).
+    /// pt[i] = ad[i] = i for i in 0..len.
+    /// Generated with the original C reference implementation from Ted Krovetz:
+    /// for each length L it emits (L,L), then (0,L), then (L,0).
+    static SPEC_VECTORS: [(usize, usize, &[u8], &[u8]); 16] = [
+        (
+            0,
+            0,
+            &[],
+            &[
+                0x19, 0x7B, 0x9C, 0x3C, 0x44, 0x1D, 0x3C, 0x83, 0xEA, 0xFB, 0x2B, 0xEF, 0x63, 0x3B,
+                0x91, 0x82,
+            ],
+        ),
+        (
+            8,
+            8,
+            &[0x92, 0xB6, 0x57, 0x13, 0x0A, 0x74, 0xB8, 0x5A],
+            &[
+                0x16, 0xDC, 0x76, 0xA4, 0x6D, 0x47, 0xE1, 0xEA, 0xD5, 0x37, 0x20, 0x9E, 0x8A, 0x96,
+                0xD1, 0x4E,
+            ],
+        ),
+        (
+            0,
+            8,
+            &[],
+            &[
+                0x98, 0xB9, 0x15, 0x52, 0xC8, 0xC0, 0x09, 0x18, 0x50, 0x44, 0xE3, 0x0A, 0x6E, 0xB2,
+                0xFE, 0x21,
+            ],
+        ),
+        (
+            8,
+            0,
+            &[0x92, 0xB6, 0x57, 0x13, 0x0A, 0x74, 0xB8, 0x5A],
+            &[
+                0x97, 0x1E, 0xFF, 0xCA, 0xE1, 0x9A, 0xD4, 0x71, 0x6F, 0x88, 0xE8, 0x7B, 0x87, 0x1F,
+                0xBE, 0xED,
+            ],
+        ),
+        (
+            16,
+            16,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22,
+            ],
+            &[
+                0x77, 0x6C, 0x99, 0x24, 0xD6, 0x72, 0x3A, 0x1F, 0xC4, 0x52, 0x45, 0x32, 0xAC, 0x3E,
+                0x5B, 0xEB,
+            ],
+        ),
+        (
+            0,
+            16,
+            &[],
+            &[
+                0x7D, 0xDB, 0x8E, 0x6C, 0xEA, 0x68, 0x14, 0x86, 0x62, 0x12, 0x50, 0x96, 0x19, 0xB1,
+                0x9C, 0xC6,
+            ],
+        ),
+        (
+            16,
+            0,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22,
+            ],
+            &[
+                0x13, 0xCC, 0x8B, 0x74, 0x78, 0x07, 0x12, 0x1A, 0x4C, 0xBB, 0x3E, 0x4B, 0xD6, 0xB4,
+                0x56, 0xAF,
+            ],
+        ),
+        (
+            24,
+            24,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22, 0xFC, 0xFC, 0xEE, 0x7A, 0x2A, 0x8D, 0x4D, 0x48,
+            ],
+            &[
+                0x5F, 0xA9, 0x4F, 0xC3, 0xF3, 0x88, 0x20, 0xF1, 0xDC, 0x3F, 0x3D, 0x1F, 0xD4, 0xE5,
+                0x5E, 0x1C,
+            ],
+        ),
+        (
+            0,
+            24,
+            &[],
+            &[
+                0x28, 0x20, 0x26, 0xDA, 0x30, 0x68, 0xBC, 0x9F, 0xA1, 0x18, 0x68, 0x1D, 0x55, 0x9F,
+                0x10, 0xF6,
+            ],
+        ),
+        (
+            24,
+            0,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22, 0xFC, 0xFC, 0xEE, 0x7A, 0x2A, 0x8D, 0x4D, 0x48,
+            ],
+            &[
+                0x6E, 0xF2, 0xF5, 0x25, 0x87, 0xFD, 0xA0, 0xED, 0x97, 0xDC, 0x7E, 0xED, 0xE2, 0x41,
+                0xDF, 0x68,
+            ],
+        ),
+        (
+            32,
+            32,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22, 0xCE, 0xAA, 0xB9, 0xB0, 0x5D, 0xF7, 0x71, 0xA6, 0x57, 0x14, 0x9D, 0x53,
+                0x77, 0x34, 0x63, 0xCB,
+            ],
+            &[
+                0xB2, 0xA0, 0x40, 0xDD, 0x3B, 0xD5, 0x16, 0x43, 0x72, 0xD7, 0x6D, 0x7B, 0xB6, 0x82,
+                0x42, 0x40,
+            ],
+        ),
+        (
+            0,
+            32,
+            &[],
+            &[
+                0xE1, 0xE0, 0x72, 0x63, 0x3B, 0xAD, 0xE5, 0x1A, 0x60, 0xE8, 0x59, 0x51, 0xD9, 0xC4,
+                0x2A, 0x1B,
+            ],
+        ),
+        (
+            32,
+            0,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22, 0xCE, 0xAA, 0xB9, 0xB0, 0x5D, 0xF7, 0x71, 0xA6, 0x57, 0x14, 0x9D, 0x53,
+                0x77, 0x34, 0x63, 0xCB,
+            ],
+            &[
+                0x4A, 0x3B, 0xAE, 0x82, 0x44, 0x65, 0xCF, 0xDA, 0xF8, 0xC4, 0x1F, 0xC5, 0x0C, 0x7D,
+                0xF9, 0xD9,
+            ],
+        ),
+        (
+            40,
+            40,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22, 0xCE, 0xAA, 0xB9, 0xB0, 0x5D, 0xF7, 0x71, 0xA6, 0x57, 0x14, 0x9D, 0x53,
+                0x77, 0x34, 0x63, 0xCB, 0x68, 0xC6, 0x57, 0x78, 0xB0, 0x58, 0xA6, 0x35,
+            ],
+            &[
+                0x65, 0x9C, 0x62, 0x32, 0x11, 0xDE, 0xEA, 0x0D, 0xE3, 0x0D, 0x2C, 0x38, 0x18, 0x79,
+                0xF4, 0xC8,
+            ],
+        ),
+        (
+            0,
+            40,
+            &[],
+            &[
+                0x7A, 0xEB, 0x7A, 0x69, 0xA1, 0x68, 0x7D, 0xD0, 0x82, 0xCA, 0x27, 0xB0, 0xD9, 0xA3,
+                0x70, 0x96,
+            ],
+        ),
+        (
+            40,
+            0,
+            &[
+                0xBE, 0xA5, 0xE8, 0x79, 0x8D, 0xBE, 0x71, 0x10, 0x03, 0x1C, 0x14, 0x4D, 0xA0, 0xB2,
+                0x61, 0x22, 0xCE, 0xAA, 0xB9, 0xB0, 0x5D, 0xF7, 0x71, 0xA6, 0x57, 0x14, 0x9D, 0x53,
+                0x77, 0x34, 0x63, 0xCB, 0x68, 0xC6, 0x57, 0x78, 0xB0, 0x58, 0xA6, 0x35,
+            ],
+            &[
+                0x06, 0x0C, 0x84, 0x67, 0xF4, 0xAB, 0xAB, 0x5E, 0x8B, 0x3C, 0x20, 0x67, 0xA2, 0xE1,
+                0x15, 0xDC,
+            ],
+        ),
+    ];
+
+    /// Spec test data: pt[i] = ad[i] = i.
+    fn spec_data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| i as u8).collect()
+    }
+
+    /// Encrypt out-of-place with contiguous plaintext. Returns (ct, tag).
+    fn enc_contiguous(
+        ctx: &mut AEctx,
+        nonce: &[u8; 12],
+        pt: &[u8],
+        ad: &[u8],
+    ) -> (Vec<u8>, [u8; 16]) {
+        let mut out = vec![0u8; pt.len() + 16];
+        ctx.ae_encrypt(
+            EncryptIO::OutOfPlace {
+                in_pt: PlainText::Contiguous(pt),
+                out: &mut out,
+            },
+            nonce,
+            ad,
+        )
+        .expect("encrypt failed");
+        let (ct, tag) = out.split_at(pt.len());
+        (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
+    }
+
+    /// Encrypt in place. Returns (ct, tag).
+    fn enc_in_place(
+        ctx: &mut AEctx,
+        nonce: &[u8; 12],
+        pt: &[u8],
+        ad: &[u8],
+    ) -> (Vec<u8>, [u8; 16]) {
+        let mut buf = pt.to_vec();
+        buf.extend([0u8; 16]);
+        ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), nonce, ad)
+            .expect("encrypt failed");
+        let (ct, tag) = buf.split_at(pt.len());
+        (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
+    }
+
+    /// Encrypt out-of-place with scattered plaintext split at `split`. Returns (ct, tag).
+    fn enc_scattered(
+        ctx: &mut AEctx,
+        nonce: &[u8; 12],
+        pt: &[u8],
+        split: usize,
+        ad: &[u8],
+    ) -> (Vec<u8>, [u8; 16]) {
+        let mut out = vec![0u8; pt.len() + 16];
+        ctx.ae_encrypt(
+            EncryptIO::OutOfPlace {
+                in_pt: PlainText::Scattered(&pt[..split], &pt[split..]),
+                out: &mut out,
+            },
+            nonce,
+            ad,
+        )
+        .expect("encrypt failed");
+        let (ct, tag) = out.split_at(pt.len());
+        (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
+    }
+
+    /// Check one vector in every API mode: in place, out-of-place contiguous,
+    /// and out-of-place scattered at every split point.
+    fn check_vector(ptl: usize, adl: usize, ct_exp: &[u8], tag_exp: &[u8]) {
+        let (pt, ad) = (spec_data(ptl), spec_data(adl));
+
+        let mut ctx = AEctx::new(&SPEC_KEY);
+        let (ct, tag) = enc_in_place(&mut ctx, &SPEC_NONCE, &pt, &ad);
+        assert_eq!(
+            ct.as_slice(),
+            ct_exp,
+            "in-place ct mismatch for ptl={} adl={}",
+            ptl,
+            adl
+        );
+        assert_eq!(
+            &tag[..],
+            tag_exp,
+            "in-place tag mismatch for ptl={} adl={}",
+            ptl,
+            adl
+        );
+
+        let mut ctx = AEctx::new(&SPEC_KEY);
+        let (ct, tag) = enc_contiguous(&mut ctx, &SPEC_NONCE, &pt, &ad);
+        assert_eq!(
+            ct.as_slice(),
+            ct_exp,
+            "out-of-place ct mismatch for ptl={} adl={}",
+            ptl,
+            adl
+        );
+        assert_eq!(
+            &tag[..],
+            tag_exp,
+            "out-of-place tag mismatch for ptl={} adl={}",
+            ptl,
+            adl
+        );
+
+        for split in 0..=ptl {
+            let mut ctx = AEctx::new(&SPEC_KEY);
+            let (ct, tag) = enc_scattered(&mut ctx, &SPEC_NONCE, &pt, split, &ad);
+            assert_eq!(
+                ct.as_slice(),
+                ct_exp,
+                "scattered split={} ct mismatch for ptl={} adl={}",
+                split,
+                ptl,
+                adl
+            );
+            assert_eq!(
+                &tag[..],
+                tag_exp,
+                "scattered split={} tag mismatch for ptl={} adl={}",
+                split,
+                ptl,
+                adl
+            );
+        }
+    }
+
+    #[test]
+    fn spec_vectors() {
+        for &(ptl, adl, ct_exp, tag_exp) in &SPEC_VECTORS {
+            check_vector(ptl, adl, ct_exp, tag_exp);
+        }
+    }
+
+    /// A single context is reused for every vector, as the C reference harness
+    /// does; this exercises the per-call state resets.
+    #[test]
+    fn spec_vectors_reused_context() {
+        let mut ctx = AEctx::new(&SPEC_KEY);
+        for &(ptl, adl, ct_exp, tag_exp) in &SPEC_VECTORS {
+            let (pt, ad) = (spec_data(ptl), spec_data(adl));
+            let (ct, tag) = enc_contiguous(&mut ctx, &SPEC_NONCE, &pt, &ad);
+            assert_eq!(
+                ct.as_slice(),
+                ct_exp,
+                "reused context ct mismatch for ptl={} adl={}",
+                ptl,
+                adl
+            );
+            assert_eq!(
+                &tag[..],
+                tag_exp,
+                "reused context tag mismatch for ptl={} adl={}",
+                ptl,
+                adl
+            );
+        }
     }
 }
