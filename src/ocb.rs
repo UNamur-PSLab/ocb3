@@ -6,8 +6,6 @@ use crate::Result;
 use crate::aes::AesKey;
 use crate::sse::*;
 use core::arch::x86_64::*;
-use std::env::consts;
-use std::num;
 
 const L_TABLE_SZ: usize = 16;
 const BPI: usize = 8;
