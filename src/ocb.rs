@@ -9,6 +9,8 @@ use core::arch::x86_64::*;
 
 const L_TABLE_SZ: usize = 16;
 const BPI: usize = 8;
+const PAGE_SIZE_4K: usize = 4096;
+const PAGE_OFFSET_MASK: usize = PAGE_SIZE_4K - 1;
 
 #[repr(C, align(16))]
 pub struct AEctx {
@@ -194,11 +196,23 @@ impl AEctx {
                 remaining -= 16;
             }
             if remaining > 0 {
-                let mut tmp = [0u8; 16];
-                core::ptr::copy(ad_ptr, tmp.as_mut_ptr(), remaining);
-                tmp[remaining] = 0x80;
+                // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
+                // within the same page, overreading partial bytes cannot cross into an unmapped
+                // page and will never cause a page fault. Otherwise we safely copy up to page
+                // boundary.
+                let ad0 = if ((ad_ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
+                    let raw = _mm_loadu_si128(ad_ptr as *const __m128i);
+                    _mm_or_si128(
+                        _mm_shuffle_epi8(raw, TAIL_LOAD_MASK.get(remaining)),
+                        TAIL_PAD_80.get(remaining),
+                    )
+                } else {
+                    let mut tmp = [0u8; 16];
+                    core::ptr::copy_nonoverlapping(ad_ptr, tmp.as_mut_ptr(), remaining);
+                    tmp[remaining] = 0x80;
+                    _mm_loadu_si128(tmp.as_ptr() as *const __m128i)
+                };
                 ad_offset = xor_block(ad_offset, self.Lstar);
-                let ad0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
                 let ta = xor_block(ad_offset, ad0);
                 let ct = self.encrypt_key.AES_encrypt_block(ta);
                 ad_checksum = xor_block(ad_checksum, ct);
@@ -376,18 +390,31 @@ impl AEctx {
         data_len: usize,
         ct_ptr: *mut u8,
     ) -> *mut u8 {
-        let mut tmp = [0u8; 16];
-        core::ptr::copy_nonoverlapping(data_ptr, tmp.as_mut_ptr(), data_len);
-        tmp[data_len] = 0x80;
-        let pt_padded = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
+        // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
+        // within the same page, overreading partial bytes cannot cross into an unmapped
+        // page and will never cause a page fault. Otherwise we safely copy up to page
+        // boundary.
+        let pt_padded = if ((data_ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
+            let raw = _mm_loadu_si128(data_ptr as *const __m128i);
+            _mm_or_si128(
+                _mm_shuffle_epi8(raw, TAIL_LOAD_MASK.get(data_len)),
+                TAIL_PAD_80.get(data_len),
+            )
+        } else {
+            let mut tmp = [0u8; 16];
+            core::ptr::copy_nonoverlapping(data_ptr, tmp.as_mut_ptr(), data_len);
+            tmp[data_len] = 0x80;
+            _mm_loadu_si128(tmp.as_ptr() as *const __m128i)
+        };
         self.checksum = xor_block(self.checksum, pt_padded);
         let t = xor_block(self.offset, self.Lstar);
         let pad = self.encrypt_key.AES_encrypt_block(t);
-        let mut pad_bytes = [0u8; 16];
-        _mm_storeu_si128(pad_bytes.as_mut_ptr() as *mut __m128i, pad);
-        for i in 0..data_len {
-            *ct_ptr.add(i) = tmp[i] ^ pad_bytes[i];
-        }
+        let ct_block = xor_block(pt_padded, pad);
+
+        let old = _mm_loadu_si128(ct_ptr as *const __m128i);
+        let blended = _mm_blendv_epi8(old, ct_block, TAIL_STORE_MASK.get(data_len));
+        _mm_storeu_si128(ct_ptr as *mut __m128i, blended);
+
         self.offset = t;
         ct_ptr.add(data_len)
     }
