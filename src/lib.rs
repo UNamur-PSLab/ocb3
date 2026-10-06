@@ -81,7 +81,7 @@ pub enum CryptoError {
 }
 
 mod aes;
-mod ocb;
+pub mod ocb;
 #[cfg(target_arch = "x86_64")]
 mod sse;
 

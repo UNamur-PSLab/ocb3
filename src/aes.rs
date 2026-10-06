@@ -87,7 +87,7 @@ impl AesKey {
     }
 
     /// AES encrypt on unaligned in/out memory. On modern processors, unaligned
-    /// store and load perform equally to aligned ones on aligned memory.
+    #[inline(always)]
     pub(crate) fn AES_encrypt_block(&mut self, mut in_pt: __m128i) -> __m128i {
         unsafe {
             let rnds = 10;

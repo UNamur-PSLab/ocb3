@@ -11,7 +11,7 @@ const L_TABLE_SZ: usize = 16;
 const BPI: usize = 8;
 
 #[repr(C, align(16))]
-struct AEctx {
+pub struct AEctx {
     offset: __m128i,
     checksum: __m128i,
     Lstar: __m128i,
@@ -92,100 +92,102 @@ impl AEctx {
         let l2 = self.L[2];
         let mut ad_ptr = ad.as_ptr();
         unsafe {
+            let mut ad_offset = self.ad_offset;
+            let mut ad_checksum = self.ad_checksum;
             for _ in 0..num_bpi {
                 ad_blocks_num += BPI;
                 let tz = ad_blocks_num.trailing_zeros() as usize;
-                let oa = xor_block(self.ad_offset, l0);
+                let oa = xor_block(ad_offset, l0);
                 let ad0 = _mm_loadu_si128(ad_ptr as *const __m128i);
                 let ta = xor_block(oa, ad0);
                 let ct = self.encrypt_key.AES_encrypt_block(ta);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let oa1 = xor_block(oa, l1);
                 let ad1 = _mm_loadu_si128(ad_ptr.add(16) as *const __m128i);
                 let ta1 = xor_block(oa1, ad1);
                 let ct = self.encrypt_key.AES_encrypt_block(ta1);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
-                let oa2 = xor_block(self.ad_offset, l1);
+                ad_checksum = xor_block(ad_checksum, ct);
+                let oa2 = xor_block(ad_offset, l1);
                 let ad2 = _mm_loadu_si128(ad_ptr.add(32) as *const __m128i);
                 let ta2 = xor_block(oa2, ad2);
                 let ct = self.encrypt_key.AES_encrypt_block(ta2);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let oa3 = xor_block(oa2, l2);
                 let ad3 = _mm_loadu_si128(ad_ptr.add(48) as *const __m128i);
                 let ta3 = xor_block(oa3, ad3);
                 let ct = self.encrypt_key.AES_encrypt_block(ta3);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let oa4 = xor_block(oa1, l2);
                 let ad4 = _mm_loadu_si128(ad_ptr.add(64) as *const __m128i);
                 let ta4 = xor_block(oa4, ad4);
                 let ct = self.encrypt_key.AES_encrypt_block(ta4);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let oa5 = xor_block(oa, l2);
                 let ad5 = _mm_loadu_si128(ad_ptr.add(80) as *const __m128i);
                 let ta5 = xor_block(oa5, ad5);
                 let ct = self.encrypt_key.AES_encrypt_block(ta5);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
-                let oa6 = xor_block(self.ad_offset, l2);
+                ad_checksum = xor_block(ad_checksum, ct);
+                let oa6 = xor_block(ad_offset, l2);
                 let ad6 = _mm_loadu_si128(ad_ptr.add(96) as *const __m128i);
                 let ta6 = xor_block(oa6, ad6);
                 let ct = self.encrypt_key.AES_encrypt_block(ta6);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
-                self.ad_offset = xor_block(oa6, self.L[tz]);
+                ad_checksum = xor_block(ad_checksum, ct);
+                ad_offset = xor_block(oa6, self.L[tz]);
                 let ad7 = _mm_loadu_si128(ad_ptr.add(112) as *const __m128i);
-                let ta7 = xor_block(self.ad_offset, ad7);
+                let ta7 = xor_block(ad_offset, ad7);
                 let ct = self.encrypt_key.AES_encrypt_block(ta7);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 ad_ptr = ad_ptr.add(128);
             }
 
             let mut remaining = ad.len() % (BPI * 16);
             let mut k = 0;
             if remaining >= 64 {
-                let bl = xor_block(self.ad_offset, l0);
+                let bl = xor_block(ad_offset, l0);
                 let ad0 = _mm_loadu_si128(ad_ptr as *const __m128i);
                 let ta0 = xor_block(bl, ad0);
                 let ct = self.encrypt_key.AES_encrypt_block(ta0);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let bl = xor_block(bl, l1);
                 let ad1 = _mm_loadu_si128(ad_ptr.add(16) as *const __m128i);
                 let ta1 = xor_block(bl, ad1);
                 let ct = self.encrypt_key.AES_encrypt_block(ta1);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let ad2 = _mm_loadu_si128(ad_ptr.add(32) as *const __m128i);
-                self.ad_offset = xor_block(self.ad_offset, l1);
-                let ta2 = xor_block(self.ad_offset, ad2);
+                ad_offset = xor_block(ad_offset, l1);
+                let ta2 = xor_block(ad_offset, ad2);
                 let ct = self.encrypt_key.AES_encrypt_block(ta2);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
-                self.ad_offset = xor_block(self.ad_offset, l2);
+                ad_checksum = xor_block(ad_checksum, ct);
+                ad_offset = xor_block(ad_offset, l2);
                 let ad3 = _mm_loadu_si128(ad_ptr.add(48) as *const __m128i);
-                let ta3 = xor_block(self.ad_offset, ad3);
+                let ta3 = xor_block(ad_offset, ad3);
                 let ct = self.encrypt_key.AES_encrypt_block(ta3);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 remaining -= 64;
                 k += 4;
                 ad_ptr = ad_ptr.add(64);
             }
             if remaining >= 32 {
-                self.ad_offset = xor_block(self.ad_offset, l0);
+                ad_offset = xor_block(ad_offset, l0);
                 let ad0 = _mm_loadu_si128(ad_ptr as *const __m128i);
-                let ta0 = xor_block(self.ad_offset, ad0);
+                let ta0 = xor_block(ad_offset, ad0);
                 let ct = self.encrypt_key.AES_encrypt_block(ta0);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 let tz = (k + 2u8).trailing_zeros() as usize;
-                self.ad_offset = xor_block(self.ad_offset, self.L[tz]);
+                ad_offset = xor_block(ad_offset, self.L[tz]);
                 let ad1 = _mm_loadu_si128(ad_ptr.add(16) as *const __m128i);
-                let ta1 = xor_block(self.ad_offset, ad1);
+                let ta1 = xor_block(ad_offset, ad1);
                 let ct = self.encrypt_key.AES_encrypt_block(ta1);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 ad_ptr = ad_ptr.add(32);
                 remaining -= 32;
             }
             if remaining >= 16 {
-                self.ad_offset = xor_block(self.ad_offset, l0);
+                ad_offset = xor_block(ad_offset, l0);
                 let ad0 = _mm_loadu_si128(ad_ptr as *const __m128i);
-                let ta0 = xor_block(self.ad_offset, ad0);
+                let ta0 = xor_block(ad_offset, ad0);
                 let ct = self.encrypt_key.AES_encrypt_block(ta0);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
                 ad_ptr = ad_ptr.add(16);
                 remaining -= 16;
             }
@@ -193,70 +195,102 @@ impl AEctx {
                 let mut tmp = [0u8; 16];
                 core::ptr::copy(ad_ptr, tmp.as_mut_ptr(), remaining);
                 tmp[remaining] = 0x80;
-                self.ad_offset = xor_block(self.ad_offset, self.Lstar);
+                ad_offset = xor_block(ad_offset, self.Lstar);
                 let ad0 = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
-                let ta = xor_block(self.ad_offset, ad0);
+                let ta = xor_block(ad_offset, ad0);
                 let ct = self.encrypt_key.AES_encrypt_block(ta);
-                self.ad_checksum = xor_block(self.ad_checksum, ct);
+                ad_checksum = xor_block(ad_checksum, ct);
             }
+            self.ad_offset = ad_offset;
+            self.ad_checksum = ad_checksum;
         }
     }
 
-    /// Encrypts one 16-byte block
-    /// Returns oa (the block offset) and updates self.offset and self.checksum.
     #[inline(always)]
-    unsafe fn enc_block(&mut self, l: __m128i, pt_ptr: *const u8, ct_ptr: *mut u8) -> __m128i {
-        let oa = xor_block(self.offset, l);
+    unsafe fn enc_block(
+        &mut self,
+        oa: __m128i,
+        pt_ptr: *const u8,
+        ct_ptr: *mut u8,
+        checksum: &mut __m128i,
+    ) {
         let pt = _mm_loadu_si128(pt_ptr as *const __m128i);
         let t = xor_block(oa, pt);
         let ct = self.encrypt_key.AES_encrypt_block(t);
         _mm_storeu_si128(ct_ptr as *mut __m128i, xor_block(ct, oa));
-        self.checksum = xor_block(self.checksum, pt);
-        self.offset = oa;
-        oa
+        *checksum = xor_block(*checksum, pt);
     }
 
-    /// Encrypts a single block at `pt_ptr`, incrementing `block_num` and using `L[ntz(block_num)]`.
     #[inline(always)]
     unsafe fn enc_single_block(&mut self, pt_ptr: *const u8, ct_ptr: *mut u8, block_num: &mut u32) {
         *block_num += 1;
         let ntz = block_num.trailing_zeros() as usize;
-        self.enc_block(self.L[ntz], pt_ptr, ct_ptr);
+        let oa = xor_block(self.offset, self.L[ntz]);
+        let mut checksum = self.checksum;
+        self.enc_block(oa, pt_ptr, ct_ptr, &mut checksum);
+        self.checksum = checksum;
+        self.offset = oa;
     }
 
-    /// Encrypts a full BPI (8-block) group using the algebraic offset shortcut.
-    /// `block_num` is the block count **before** this group and MUST be a multiple of 8.
-    /// Returns the updated `block_num`.
     #[inline(always)]
-    unsafe fn enc_bpi(&mut self, pt_ptr: *const u8, ct_ptr: *mut u8, block_num: u32) -> u32 {
+    unsafe fn enc_single_block_local(
+        &mut self,
+        pt_ptr: *const u8,
+        ct_ptr: *mut u8,
+        block_num: &mut u32,
+        offset: __m128i,
+        checksum: &mut __m128i,
+    ) -> __m128i {
+        *block_num += 1;
+        let ntz = block_num.trailing_zeros() as usize;
+        let oa = xor_block(offset, self.L[ntz]);
+        self.enc_block(oa, pt_ptr, ct_ptr, checksum);
+        oa
+    }
+
+    #[inline(always)]
+    unsafe fn enc_bpi(
+        &mut self,
+        pt_ptr: *const u8,
+        ct_ptr: *mut u8,
+        block_num: u32,
+        offset: __m128i,
+        checksum: &mut __m128i,
+    ) -> (__m128i, u32) {
         debug_assert_eq!(block_num % 8, 0);
         let block_num = block_num + BPI as u32;
         let l0 = self.L[0];
         let l1 = self.L[1];
         let l2 = self.L[2];
-        let offset = self.offset;
 
-        let oa0 = self.enc_block(l0, pt_ptr, ct_ptr);
-        let oa1 = self.enc_block(l1, pt_ptr.add(16), ct_ptr.add(16));
-        let _ = self.enc_block(l0, pt_ptr.add(32), ct_ptr.add(32));
-        let _ = self.enc_block(l2, pt_ptr.add(48), ct_ptr.add(48));
-        // algebraic shortcuts — valid only when starting at a multiple-of-8 boundary
-        self.offset = oa1;
-        let _ = self.enc_block(l2, pt_ptr.add(64), ct_ptr.add(64));
-        self.offset = oa0;
-        let _ = self.enc_block(l2, pt_ptr.add(80), ct_ptr.add(80));
-        self.offset = offset;
-        let oa6 = self.enc_block(l2, pt_ptr.add(96), ct_ptr.add(96));
+        let oa0 = xor_block(offset, l0);
+        self.enc_block(oa0, pt_ptr, ct_ptr, checksum);
+
+        let oa1 = xor_block(oa0, l1);
+        self.enc_block(oa1, pt_ptr.add(16), ct_ptr.add(16), checksum);
+
+        let oa2 = xor_block(oa1, l0);
+        self.enc_block(oa2, pt_ptr.add(32), ct_ptr.add(32), checksum);
+
+        let oa3 = xor_block(oa2, l2);
+        self.enc_block(oa3, pt_ptr.add(48), ct_ptr.add(48), checksum);
+
+        let oa4 = xor_block(oa1, l2);
+        self.enc_block(oa4, pt_ptr.add(64), ct_ptr.add(64), checksum);
+
+        let oa5 = xor_block(oa0, l2);
+        self.enc_block(oa5, pt_ptr.add(80), ct_ptr.add(80), checksum);
+
+        let oa6 = xor_block(offset, l2);
+        self.enc_block(oa6, pt_ptr.add(96), ct_ptr.add(96), checksum);
+
         let ntz = block_num.trailing_zeros() as usize;
-        self.offset = oa6;
-        let _ = self.enc_block(self.L[ntz], pt_ptr.add(112), ct_ptr.add(112));
+        let oa7 = xor_block(oa6, self.L[ntz]);
+        self.enc_block(oa7, pt_ptr.add(112), ct_ptr.add(112), checksum);
 
-        block_num
+        (oa7, block_num)
     }
 
-    /// Encrypts contiguous full blocks from `pt_ptr` into `ct_ptr`.
-    /// First aligns to an 8-block boundary, then processes full BPI groups,
-    /// then finishes any remaining full blocks.
     #[inline(always)]
     unsafe fn enc_contiguous(
         &mut self,
@@ -265,30 +299,33 @@ impl AEctx {
         mut full_blocks: usize,
         block_num: &mut u32,
     ) -> (*const u8, *mut u8) {
-        // Align to an 8-block boundary so enc_bpi can be safely used
+        let mut offset = self.offset;
+        let mut checksum = self.checksum;
+
         while !(*block_num).is_multiple_of(8) && full_blocks > 0 {
-            self.enc_single_block(pt_ptr, ct_ptr, block_num);
+            offset = self.enc_single_block_local(pt_ptr, ct_ptr, block_num, offset, &mut checksum);
             pt_ptr = pt_ptr.add(16);
             ct_ptr = ct_ptr.add(16);
             full_blocks -= 1;
         }
 
-        // Process aligned full BPI groups using the original implementation algebraic shortcut
         let num_bpi = full_blocks / BPI;
         for _ in 0..num_bpi {
-            *block_num = self.enc_bpi(pt_ptr, ct_ptr, *block_num);
+            (offset, *block_num) = self.enc_bpi(pt_ptr, ct_ptr, *block_num, offset, &mut checksum);
             pt_ptr = pt_ptr.add(BPI * 16);
             ct_ptr = ct_ptr.add(BPI * 16);
         }
         full_blocks %= BPI;
 
-        // Process remaining full blocks (< 8)
         while full_blocks > 0 {
-            self.enc_single_block(pt_ptr, ct_ptr, block_num);
+            offset = self.enc_single_block_local(pt_ptr, ct_ptr, block_num, offset, &mut checksum);
             pt_ptr = pt_ptr.add(16);
             ct_ptr = ct_ptr.add(16);
             full_blocks -= 1;
         }
+
+        self.offset = offset;
+        self.checksum = checksum;
 
         (pt_ptr, ct_ptr)
     }
@@ -328,7 +365,7 @@ impl AEctx {
         _mm_storeu_si128(ct_ptr as *mut __m128i, self.offset);
     }
 
-    /// Todo
+    #[target_feature(enable = "aes,ssse3,sse4.1")]
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
         self.offset = self.gen_offset_from_nonce(nonce);
@@ -661,15 +698,17 @@ mod tests {
         ad: &[u8],
     ) -> (Vec<u8>, [u8; 16]) {
         let mut out = vec![0u8; pt.len() + 16];
-        ctx.ae_encrypt(
-            EncryptIO::OutOfPlace {
-                in_pt: PlainText::Contiguous(pt),
-                out: &mut out,
-            },
-            nonce,
-            ad,
-        )
-        .expect("encrypt failed");
+        unsafe {
+            ctx.ae_encrypt(
+                EncryptIO::OutOfPlace {
+                    in_pt: PlainText::Contiguous(pt),
+                    out: &mut out,
+                },
+                nonce,
+                ad,
+            )
+            .expect("encrypt failed");
+        }
         let (ct, tag) = out.split_at(pt.len());
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
@@ -683,8 +722,10 @@ mod tests {
     ) -> (Vec<u8>, [u8; 16]) {
         let mut buf = pt.to_vec();
         buf.extend([0u8; 16]);
-        ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), nonce, ad)
-            .expect("encrypt failed");
+        unsafe {
+            ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), nonce, ad)
+                .expect("encrypt failed");
+        }
         let (ct, tag) = buf.split_at(pt.len());
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
@@ -698,15 +739,17 @@ mod tests {
         ad: &[u8],
     ) -> (Vec<u8>, [u8; 16]) {
         let mut out = vec![0u8; pt.len() + 16];
-        ctx.ae_encrypt(
-            EncryptIO::OutOfPlace {
-                in_pt: PlainText::Scattered(&pt[..split], &pt[split..]),
-                out: &mut out,
-            },
-            nonce,
-            ad,
-        )
-        .expect("encrypt failed");
+        unsafe {
+            ctx.ae_encrypt(
+                EncryptIO::OutOfPlace {
+                    in_pt: PlainText::Scattered(&pt[..split], &pt[split..]),
+                    out: &mut out,
+                },
+                nonce,
+                ad,
+            )
+            .expect("encrypt failed");
+        }
         let (ct, tag) = out.split_at(pt.len());
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
