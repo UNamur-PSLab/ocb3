@@ -120,7 +120,8 @@ impl AEctx {
                 let oa4 = xor_block(oa1, l2);
                 let oa5 = xor_block(oa0, l2);
                 let oa6 = xor_block(ad_offset, l2);
-                ad_offset = xor_block(oa6, self.L[tz]);
+                // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.L`.
+                ad_offset = xor_block(oa6, *self.L.get_unchecked(tz));
 
                 let ad4 = _mm_loadu_si128(ad_ptr.add(64) as *const __m128i);
                 let ad5 = _mm_loadu_si128(ad_ptr.add(80) as *const __m128i);
@@ -174,7 +175,8 @@ impl AEctx {
                 let ct = self.encrypt_key.AES_encrypt_block(ta0);
                 ad_checksum = xor_block(ad_checksum, ct);
                 let tz = (k + 2u8).trailing_zeros() as usize;
-                ad_offset = xor_block(ad_offset, self.L[tz]);
+                // SAFETY: `k` is 0 or 4, so `k + 2` is 2 or 6 and `tz` is 1, which is in-bounds for `self.L`.
+                ad_offset = xor_block(ad_offset, *self.L.get_unchecked(tz));
                 let ad1 = _mm_loadu_si128(ad_ptr.add(16) as *const __m128i);
                 let ta1 = xor_block(ad_offset, ad1);
                 let ct = self.encrypt_key.AES_encrypt_block(ta1);
@@ -225,7 +227,8 @@ impl AEctx {
     unsafe fn enc_single_block(&mut self, pt_ptr: *const u8, ct_ptr: *mut u8, block_num: &mut u32) {
         *block_num += 1;
         let ntz = block_num.trailing_zeros() as usize;
-        let oa = xor_block(self.offset, self.L[ntz]);
+        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
+        let oa = xor_block(self.offset, *self.L.get_unchecked(ntz));
         let mut checksum = self.checksum;
         self.enc_block(oa, pt_ptr, ct_ptr, &mut checksum);
         self.checksum = checksum;
@@ -243,7 +246,8 @@ impl AEctx {
     ) -> __m128i {
         *block_num += 1;
         let ntz = block_num.trailing_zeros() as usize;
-        let oa = xor_block(offset, self.L[ntz]);
+        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
+        let oa = xor_block(offset, *self.L.get_unchecked(ntz));
         self.enc_block(oa, pt_ptr, ct_ptr, checksum);
         oa
     }
@@ -298,7 +302,8 @@ impl AEctx {
         let oa5 = xor_block(oa0, l2);
         let oa6 = xor_block(offset, l2);
         let ntz = block_num.trailing_zeros() as usize;
-        let oa7 = xor_block(oa6, self.L[ntz]);
+        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
+        let oa7 = xor_block(oa6, *self.L.get_unchecked(ntz));
 
         let pt4 = _mm_loadu_si128(pt_ptr.add(64) as *const __m128i);
         let pt5 = _mm_loadu_si128(pt_ptr.add(80) as *const __m128i);
