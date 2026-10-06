@@ -97,46 +97,46 @@ impl AEctx {
             for _ in 0..num_bpi {
                 ad_blocks_num += BPI;
                 let tz = ad_blocks_num.trailing_zeros() as usize;
-                let oa = xor_block(ad_offset, l0);
-                let ad0 = _mm_loadu_si128(ad_ptr as *const __m128i);
-                let ta = xor_block(oa, ad0);
-                let ct = self.encrypt_key.AES_encrypt_block(ta);
-                ad_checksum = xor_block(ad_checksum, ct);
-                let oa1 = xor_block(oa, l1);
-                let ad1 = _mm_loadu_si128(ad_ptr.add(16) as *const __m128i);
-                let ta1 = xor_block(oa1, ad1);
-                let ct = self.encrypt_key.AES_encrypt_block(ta1);
-                ad_checksum = xor_block(ad_checksum, ct);
+                let oa0 = xor_block(ad_offset, l0);
+                let oa1 = xor_block(oa0, l1);
                 let oa2 = xor_block(ad_offset, l1);
-                let ad2 = _mm_loadu_si128(ad_ptr.add(32) as *const __m128i);
-                let ta2 = xor_block(oa2, ad2);
-                let ct = self.encrypt_key.AES_encrypt_block(ta2);
-                ad_checksum = xor_block(ad_checksum, ct);
                 let oa3 = xor_block(oa2, l2);
+
+                let ad0 = _mm_loadu_si128(ad_ptr as *const __m128i);
+                let ad1 = _mm_loadu_si128(ad_ptr.add(16) as *const __m128i);
+                let ad2 = _mm_loadu_si128(ad_ptr.add(32) as *const __m128i);
                 let ad3 = _mm_loadu_si128(ad_ptr.add(48) as *const __m128i);
-                let ta3 = xor_block(oa3, ad3);
-                let ct = self.encrypt_key.AES_encrypt_block(ta3);
-                ad_checksum = xor_block(ad_checksum, ct);
+
+                let ct_lo = self.encrypt_key.AES_encrypt_4_blocks([
+                    xor_block(oa0, ad0),
+                    xor_block(oa1, ad1),
+                    xor_block(oa2, ad2),
+                    xor_block(oa3, ad3),
+                ]);
+
+                let sum0 = xor_block(xor_block(ct_lo[0], ct_lo[1]), xor_block(ct_lo[2], ct_lo[3]));
+                ad_checksum = xor_block(ad_checksum, sum0);
+
                 let oa4 = xor_block(oa1, l2);
-                let ad4 = _mm_loadu_si128(ad_ptr.add(64) as *const __m128i);
-                let ta4 = xor_block(oa4, ad4);
-                let ct = self.encrypt_key.AES_encrypt_block(ta4);
-                ad_checksum = xor_block(ad_checksum, ct);
-                let oa5 = xor_block(oa, l2);
-                let ad5 = _mm_loadu_si128(ad_ptr.add(80) as *const __m128i);
-                let ta5 = xor_block(oa5, ad5);
-                let ct = self.encrypt_key.AES_encrypt_block(ta5);
-                ad_checksum = xor_block(ad_checksum, ct);
+                let oa5 = xor_block(oa0, l2);
                 let oa6 = xor_block(ad_offset, l2);
-                let ad6 = _mm_loadu_si128(ad_ptr.add(96) as *const __m128i);
-                let ta6 = xor_block(oa6, ad6);
-                let ct = self.encrypt_key.AES_encrypt_block(ta6);
-                ad_checksum = xor_block(ad_checksum, ct);
                 ad_offset = xor_block(oa6, self.L[tz]);
+
+                let ad4 = _mm_loadu_si128(ad_ptr.add(64) as *const __m128i);
+                let ad5 = _mm_loadu_si128(ad_ptr.add(80) as *const __m128i);
+                let ad6 = _mm_loadu_si128(ad_ptr.add(96) as *const __m128i);
                 let ad7 = _mm_loadu_si128(ad_ptr.add(112) as *const __m128i);
-                let ta7 = xor_block(ad_offset, ad7);
-                let ct = self.encrypt_key.AES_encrypt_block(ta7);
-                ad_checksum = xor_block(ad_checksum, ct);
+
+                let ct_hi = self.encrypt_key.AES_encrypt_4_blocks([
+                    xor_block(oa4, ad4),
+                    xor_block(oa5, ad5),
+                    xor_block(oa6, ad6),
+                    xor_block(ad_offset, ad7),
+                ]);
+
+                let sum1 = xor_block(xor_block(ct_hi[0], ct_hi[1]), xor_block(ct_hi[2], ct_hi[3]));
+                ad_checksum = xor_block(ad_checksum, sum1);
+
                 ad_ptr = ad_ptr.add(128);
             }
 
@@ -264,29 +264,61 @@ impl AEctx {
         let l2 = self.L[2];
 
         let oa0 = xor_block(offset, l0);
-        self.enc_block(oa0, pt_ptr, ct_ptr, checksum);
-
         let oa1 = xor_block(oa0, l1);
-        self.enc_block(oa1, pt_ptr.add(16), ct_ptr.add(16), checksum);
-
         let oa2 = xor_block(oa1, l0);
-        self.enc_block(oa2, pt_ptr.add(32), ct_ptr.add(32), checksum);
-
         let oa3 = xor_block(oa2, l2);
-        self.enc_block(oa3, pt_ptr.add(48), ct_ptr.add(48), checksum);
+
+        let pt0 = _mm_loadu_si128(pt_ptr as *const __m128i);
+        let pt1 = _mm_loadu_si128(pt_ptr.add(16) as *const __m128i);
+        let pt2 = _mm_loadu_si128(pt_ptr.add(32) as *const __m128i);
+        let pt3 = _mm_loadu_si128(pt_ptr.add(48) as *const __m128i);
+
+        let pt_sum0 = xor_block(xor_block(pt0, pt1), xor_block(pt2, pt3));
+        *checksum = xor_block(*checksum, pt_sum0);
+
+        // Encrypting 4 blocks at once seems to avoid to spill a xmm register on the stack.
+        // For 8 blocks, we needed 18 registers (16 for oa[0..7] and ta[0..7] (now directly xored)
+        // and 2 for the offset and checksum, but we only had 16.
+        //
+        // Encrypting 4 blocks at once seems to still allow to fully occupy the processor's
+        // pipelines.
+        let ct_lo = self.encrypt_key.AES_encrypt_4_blocks([
+            xor_block(oa0, pt0),
+            xor_block(oa1, pt1),
+            xor_block(oa2, pt2),
+            xor_block(oa3, pt3),
+        ]);
+
+        _mm_storeu_si128(ct_ptr as *mut __m128i, xor_block(ct_lo[0], oa0));
+        _mm_storeu_si128(ct_ptr.add(16) as *mut __m128i, xor_block(ct_lo[1], oa1));
+        _mm_storeu_si128(ct_ptr.add(32) as *mut __m128i, xor_block(ct_lo[2], oa2));
+        _mm_storeu_si128(ct_ptr.add(48) as *mut __m128i, xor_block(ct_lo[3], oa3));
 
         let oa4 = xor_block(oa1, l2);
-        self.enc_block(oa4, pt_ptr.add(64), ct_ptr.add(64), checksum);
-
         let oa5 = xor_block(oa0, l2);
-        self.enc_block(oa5, pt_ptr.add(80), ct_ptr.add(80), checksum);
-
         let oa6 = xor_block(offset, l2);
-        self.enc_block(oa6, pt_ptr.add(96), ct_ptr.add(96), checksum);
-
         let ntz = block_num.trailing_zeros() as usize;
         let oa7 = xor_block(oa6, self.L[ntz]);
-        self.enc_block(oa7, pt_ptr.add(112), ct_ptr.add(112), checksum);
+
+        let pt4 = _mm_loadu_si128(pt_ptr.add(64) as *const __m128i);
+        let pt5 = _mm_loadu_si128(pt_ptr.add(80) as *const __m128i);
+        let pt6 = _mm_loadu_si128(pt_ptr.add(96) as *const __m128i);
+        let pt7 = _mm_loadu_si128(pt_ptr.add(112) as *const __m128i);
+
+        let pt_sum1 = xor_block(xor_block(pt4, pt5), xor_block(pt6, pt7));
+        *checksum = xor_block(*checksum, pt_sum1);
+
+        let ct_hi = self.encrypt_key.AES_encrypt_4_blocks([
+            xor_block(oa4, pt4),
+            xor_block(oa5, pt5),
+            xor_block(oa6, pt6),
+            xor_block(oa7, pt7),
+        ]);
+
+        _mm_storeu_si128(ct_ptr.add(64) as *mut __m128i, xor_block(ct_hi[0], oa4));
+        _mm_storeu_si128(ct_ptr.add(80) as *mut __m128i, xor_block(ct_hi[1], oa5));
+        _mm_storeu_si128(ct_ptr.add(96) as *mut __m128i, xor_block(ct_hi[2], oa6));
+        _mm_storeu_si128(ct_ptr.add(112) as *mut __m128i, xor_block(ct_hi[3], oa7));
 
         (oa7, block_num)
     }
@@ -369,11 +401,9 @@ impl AEctx {
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
         self.offset = self.gen_offset_from_nonce(nonce);
-        unsafe {
-            self.ad_offset = _mm_setzero_si128();
-            self.ad_checksum = _mm_setzero_si128();
-            self.checksum = _mm_setzero_si128();
-        }
+        self.ad_offset = _mm_setzero_si128();
+        self.ad_checksum = _mm_setzero_si128();
+        self.checksum = _mm_setzero_si128();
         if !ad.is_empty() {
             self.process_ad(ad);
         }
