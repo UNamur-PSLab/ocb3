@@ -411,6 +411,9 @@ impl AEctx {
         let pad = self.encrypt_key.AES_encrypt_block(t);
         let ct_block = xor_block(pt_padded, pad);
 
+        //SAFETY: the ciphertext slice is required to be 16 bytes longer than the plaintext, so
+        //this cannot fall outside of the allocation. In case of InPlace encryption, this design
+        //encrypts up to the size of the input buffer - 16, so this is safe to do.
         let old = _mm_loadu_si128(ct_ptr as *const __m128i);
         let blended = _mm_blendv_epi8(old, ct_block, TAIL_STORE_MASK.get(data_len));
         _mm_storeu_si128(ct_ptr as *mut __m128i, blended);
