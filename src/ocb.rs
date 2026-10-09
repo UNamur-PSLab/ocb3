@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::EncryptIO;
+use crate::DecryptIO;
 use crate::OCB_TAG_LEN;
 use crate::PlainText;
 use crate::Result;
@@ -353,7 +354,7 @@ impl AEctx {
         let mut offset = self.offset;
         let mut checksum = self.checksum;
 
-        while !(*block_num).is_multiple_of(8) && full_blocks > 0 {
+        while !(*block_num).is_multiple_of(BPI as u32) && full_blocks > 0 {
             offset = self.enc_single_block_local(pt_ptr, ct_ptr, block_num, offset, &mut checksum);
             pt_ptr = pt_ptr.add(16);
             ct_ptr = ct_ptr.add(16);
@@ -430,6 +431,21 @@ impl AEctx {
         let ct = self.encrypt_key.AES_encrypt_block(ta);
         self.offset = xor_block(ct, self.ad_checksum);
         _mm_storeu_si128(ct_ptr as *mut __m128i, self.offset);
+    }
+
+    #[target_feature(enable = "aes,ssse3,sse4.1")]
+    pub fn ae_decrypt(&mut self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+        io.validate()?;
+        self.offset = self.gen_offset_from_nonce(nonce);
+        self.ad_offset = _mm_setzero_si128();
+        self.checksum = _mm_setzero_si128();
+        self.ad_checksum = _mm_setzero_si128();
+        if !ad.is_empty() {
+            self.process_ad(ad);
+        }
+
+        Ok(())
+
     }
 
     #[target_feature(enable = "aes,ssse3,sse4.1")]

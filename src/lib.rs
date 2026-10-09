@@ -66,10 +66,42 @@ impl<'a> EncryptIO<'a> {
     }
 }
 
+pub enum DecryptIO<'a> {
+    InPlace(&'a mut [u8]),
+    OutOfPlace {
+        in_ct: &'a [u8],
+        out_pt:  &'a mut [u8],
+    },
+}
+
+impl<'a> DecryptIO<'a> {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::OutOfPlace { in_ct, out_pt } => {
+                if in_ct.len() < OCB_TAG_LEN as usize {
+                    return Err(CryptoError::CiphertextTooSmall);
+                }
+
+                if out_pt.len() < in_ct.len().wrapping_sub(OCB_TAG_LEN as usize) {
+                    return Err(CryptoError::DestinationUnfit);
+                }
+            }
+            Self::InPlace(in_ct) => {
+                if in_ct.len() < OCB_TAG_LEN as usize {
+                    return Err(CryptoError::CiphertextTooSmall);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CryptoError {
     #[error("Plaintext cannot be longer than {MAX_PT_SIZE} bytes")]
     PlaintextTooLong,
+    #[error("The ciphertext cannot be smaller than the tag len")]
+    CiphertextTooSmall,
     #[error(
         "The size of the destination buffer does fit. It needs to be sufficient to hold the size of the plaintext plus the size of tag"
     )]
