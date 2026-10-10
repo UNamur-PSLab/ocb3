@@ -17,15 +17,15 @@ const PAGE_OFFSET_MASK: usize = PAGE_SIZE_4K - 1;
 pub struct AEctx {
     offset: __m128i,
     checksum: __m128i,
-    Lstar: __m128i,
-    Ldollar: __m128i,
+    lstar: __m128i,
+    ldollar: __m128i,
     L: [__m128i; L_TABLE_SZ],
     ad_checksum: __m128i,
     ad_offset: __m128i,
-    cached_Top: __m128i,
+    cached_top: __m128i,
     decrypt_key: AesKey,
     encrypt_key: AesKey,
-    KtopStr: [u64; 3],
+    ktop_str: [u64; 3],
 }
 
 impl AEctx {
@@ -35,24 +35,24 @@ impl AEctx {
         let mut ctx = AEctx {
             offset: zero,
             checksum: zero,
-            Lstar: zero,
-            Ldollar: zero,
+            lstar: zero,
+            ldollar: zero,
             L: [zero; L_TABLE_SZ],
             ad_checksum: zero,
             ad_offset: zero,
-            cached_Top: zero,
+            cached_top: zero,
             decrypt_key: AesKey::default(),
             encrypt_key: AesKey::default(),
-            KtopStr: [0u64; 3],
+            ktop_str: [0u64; 3],
         };
 
         // Key dependent values
         ctx.encrypt_key.AES_128_key_expansion(key);
         ctx.decrypt_key.AES_set_key_fast(&ctx.encrypt_key);
-        ctx.Lstar = ctx.encrypt_key.AES_encrypt_block(ctx.cached_Top);
-        let mut tmp_blk = swap_if_le(ctx.Lstar);
+        ctx.lstar = ctx.encrypt_key.AES_encrypt_block(ctx.cached_top);
+        let mut tmp_blk = swap_if_le(ctx.lstar);
         tmp_blk = double(tmp_blk);
-        ctx.Ldollar = swap_if_le(tmp_blk);
+        ctx.ldollar = swap_if_le(tmp_blk);
         tmp_blk = double(tmp_blk);
         ctx.L[0] = swap_if_le(tmp_blk);
 
@@ -72,14 +72,15 @@ impl AEctx {
         let idx: i32 = tmp[15] as i32 & 0x3f;
         tmp[15] &= 0xc0;
         let mut bl = loadu_block(tmp.as_ptr() as *const __m128i);
-        if unequal_blocks(bl, self.cached_Top) {
-            self.cached_Top = bl;
+        if unequal_blocks(bl, self.cached_top) {
+            self.cached_top = bl;
             bl = self.encrypt_key.AES_encrypt_block(bl);
-            [self.KtopStr[0], self.KtopStr[1]] = m128i_to_bswap_u64x2(bl);
-            self.KtopStr[2] = self.KtopStr[0] ^ (self.KtopStr[0] << 8) ^ (self.KtopStr[1] >> 56);
+            [self.ktop_str[0], self.ktop_str[1]] = m128i_to_bswap_u64x2(bl);
+            self.ktop_str[2] =
+                self.ktop_str[0] ^ (self.ktop_str[0] << 8) ^ (self.ktop_str[1] >> 56);
         }
 
-        gen_offset(&self.KtopStr, idx)
+        gen_offset(&self.ktop_str, idx)
     }
 
     #[inline(always)]
@@ -226,7 +227,7 @@ impl AEctx {
                 tmp[remaining] = 0x80;
                 loadu_block(tmp.as_ptr() as *const __m128i)
             };
-            ad_offset = xor_block(ad_offset, self.Lstar);
+            ad_offset = xor_block(ad_offset, self.lstar);
             let ta = xor_block(ad_offset, ad0);
             let ct = self.encrypt_key.AES_encrypt_block(ta);
             ad_checksum = xor_block(ad_checksum, ct);
@@ -427,7 +428,7 @@ impl AEctx {
             loadu_block(tmp.as_ptr() as *const __m128i)
         };
         self.checksum = xor_block(self.checksum, pt_padded);
-        let t = xor_block(self.offset, self.Lstar);
+        let t = xor_block(self.offset, self.lstar);
         let pad = self.encrypt_key.AES_encrypt_block(t);
         let ct_block = xor_block(pt_padded, pad);
 
@@ -445,7 +446,7 @@ impl AEctx {
     /// Compute and store the final tag
     #[inline(always)]
     unsafe fn compute_and_store_tag(&mut self, ct_ptr: *mut u8) {
-        self.offset = xor_block(self.offset, self.Ldollar);
+        self.offset = xor_block(self.offset, self.ldollar);
         let ta = xor_block(self.offset, self.checksum);
         let ct = self.encrypt_key.AES_encrypt_block(ta);
         self.offset = xor_block(ct, self.ad_checksum);
