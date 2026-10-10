@@ -463,6 +463,81 @@ impl AEctx {
         if !ad.is_empty() {
             self.process_ad(ad);
         }
+        let io_len = io.len();
+
+        let (ct_ptr, pt_ptr) = match io {
+            DecryptIO::InPlace(buf) => (buf.as_ptr(), buf.as_mut_ptr()),
+            DecryptIO::OutOfPlace { in_ct, out_pt } => (in_ct.as_ptr(), out_pt.as_mut_ptr()),
+        };
+
+        let num_bpi = (io_len - OCB_TAG_LEN as usize) / (BPI * 16);
+        let remaining = (io_len - OCB_TAG_LEN as usize) % (BPI * 16);
+
+        let l0 = self.L[0];
+        let l1 = self.L[1];
+        let l2 = self.L[2];
+        let mut block_num = 0;
+        let mut offset = self.offset;
+        let mut checksum = self.checksum;
+
+        for _ in 0..num_bpi {
+            block_num += BPI as u32;
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(oa1, l0);
+            let oa3 = xor_block(oa2, l2);
+
+            let ct0 = loadu_block(ct_ptr as *const __m128i);
+            let ct1 = loadu_block_with_offset(ct_ptr, 16);
+            let ct2 = loadu_block_with_offset(ct_ptr, 32);
+            let ct3 = loadu_block_with_offset(ct_ptr, 48);
+
+            let pt_lo = self.decrypt_key.AES_decrypt_4_blocks([
+                xor_block(oa0, ct0),
+                xor_block(oa1, ct1),
+                xor_block(oa2, ct2),
+                xor_block(oa3, ct3),
+            ]);
+
+            checksum = xor_block(
+                checksum,
+                xor_block(xor_block(pt_lo[0], pt_lo[1]), xor_block(pt_lo[2], pt_lo[3])),
+            );
+
+            storeu_block(pt_ptr as *mut __m128i, pt_lo[0]);
+            storeu_block_with_offset(pt_ptr, pt_lo[1], 16);
+            storeu_block_with_offset(pt_ptr, pt_lo[2], 32);
+            storeu_block_with_offset(pt_ptr, pt_lo[3], 48);
+
+            let oa4 = xor_block(oa1, l2);
+            let oa5 = xor_block(oa0, l2);
+            let oa6 = xor_block(offset, l2);
+            let tz = block_num.trailing_zeros() as usize;
+            let oa7 = xor_block(oa6, table_get(&self.L, tz));
+            offset = oa7;
+
+            let ct4 = loadu_block_with_offset(ct_ptr, 64);
+            let ct5 = loadu_block_with_offset(ct_ptr, 80);
+            let ct6 = loadu_block_with_offset(ct_ptr, 96);
+            let ct7 = loadu_block_with_offset(ct_ptr, 112);
+
+            let pt_hi = self.decrypt_key.AES_decrypt_4_blocks([
+                xor_block(oa4, ct4),
+                xor_block(oa5, ct5),
+                xor_block(oa5, ct6),
+                xor_block(oa5, ct7),
+            ]);
+
+            checksum = xor_block(
+                checksum,
+                xor_block(xor_block(pt_hi[0], pt_hi[1]), xor_block(pt_hi[2], pt_hi[3])),
+            );
+
+            storeu_block_with_offset(pt_ptr, pt_hi[0], 64);
+            storeu_block_with_offset(pt_ptr, pt_hi[1], 80);
+            storeu_block_with_offset(pt_ptr, pt_hi[2], 96);
+            storeu_block_with_offset(pt_ptr, pt_hi[3], 112);
+        }
 
         Ok(())
     }

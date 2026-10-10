@@ -70,7 +70,7 @@ pub enum DecryptIO<'a> {
     InPlace(&'a mut [u8]),
     OutOfPlace {
         in_ct: &'a [u8],
-        out_pt:  &'a mut [u8],
+        out_pt: &'a mut [u8],
     },
 }
 
@@ -93,6 +93,15 @@ impl<'a> DecryptIO<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Returns the length of the ciphertext.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InPlace(buf) => buf.len(),
+            Self::OutOfPlace { in_ct, .. } => in_ct.len(),
+        }
     }
 }
 

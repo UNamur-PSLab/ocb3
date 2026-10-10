@@ -127,10 +127,30 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_encrypt_8_blocks(&self, b: [__m128i; 8]) -> [__m128i; 8] {
-        let lo = self.AES_encrypt_4_blocks([b[0], b[1], b[2], b[3]]);
-        let hi = self.AES_encrypt_4_blocks([b[4], b[5], b[6], b[7]]);
-        [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+    pub(crate) fn AES_decrypt_4_blocks(&self, mut b: [__m128i; 4]) -> [__m128i; 4] {
+        unsafe {
+            let k0 = self.rd_key[0];
+            b[0] = _mm_xor_si128(b[0], k0);
+            b[1] = _mm_xor_si128(b[1], k0);
+            b[2] = _mm_xor_si128(b[2], k0);
+            b[3] = _mm_xor_si128(b[3], k0);
+
+            for j in 1..10 {
+                let kj = self.rd_key[j];
+                b[0] = _mm_aesdec_si128(b[0], kj);
+                b[1] = _mm_aesdec_si128(b[1], kj);
+                b[2] = _mm_aesdec_si128(b[2], kj);
+                b[3] = _mm_aesdec_si128(b[3], kj);
+            }
+
+            let k10 = self.rd_key[10];
+            b[0] = _mm_aesdeclast_si128(b[0], k10);
+            b[1] = _mm_aesdeclast_si128(b[1], k10);
+            b[2] = _mm_aesdeclast_si128(b[2], k10);
+            b[3] = _mm_aesdeclast_si128(b[3], k10);
+
+            b
+        }
     }
 
     pub(crate) fn AES_decrypt_block(&mut self, mut in_ct: __m128i) -> __m128i {
