@@ -87,7 +87,7 @@ pub(crate) fn gen_offset(KtopStr: &[u64; 3], bot: i32) -> __m128i {
     unsafe {
         let ptr_KtopStr = KtopStr.as_ptr();
         let hi = _mm_load_si128(ptr_KtopStr as *const __m128i);
-        let mut lo = _mm_loadu_si128(ptr_KtopStr.add(1) as *const __m128i);
+        let mut lo = _mm_loadu_si128(KtopStr[1..].as_ptr() as *const __m128i);
         let lshift = _mm_cvtsi32_si128(bot);
         let rshift = _mm_cvtsi32_si128(64i32 - bot);
         lo = _mm_xor_si128(_mm_sll_epi64(hi, lshift), _mm_srl_epi64(lo, rshift));
