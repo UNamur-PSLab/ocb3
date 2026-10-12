@@ -72,7 +72,7 @@ impl AEctx {
         let idx: i32 = tmp[15] as i32 & 0x3f;
         tmp[15] &= 0xc0;
         let mut bl = loadu_block(tmp.as_ptr() as *const __m128i);
-        if unequal_blocks(bl, self.cached_top) {
+        if equal_blocks(bl, self.cached_top) == 0 {
             self.cached_top = bl;
             bl = self.encrypt_key.AES_encrypt_block(bl);
             [self.ktop_str[0], self.ktop_str[1]] = m128i_to_bswap_u64x2(bl);
@@ -252,6 +252,21 @@ impl AEctx {
     }
 
     #[inline(always)]
+    fn dec_block(
+        &mut self,
+        oa: __m128i,
+        ct_ptr: *const u8,
+        pt_ptr: *mut u8,
+        checksum: &mut __m128i,
+    ) {
+        let ct = loadu_block(ct_ptr as *const __m128i);
+        let t = xor_block(oa, ct);
+        let pt = self.decrypt_key.AES_decrypt_block(t);
+        storeu_block(pt_ptr as *mut __m128i, pt);
+        *checksum = xor_block(*checksum, pt)
+    }
+
+    #[inline(always)]
     fn enc_single_block(&mut self, pt_ptr: *const u8, ct_ptr: *mut u8, block_num: &mut u32) {
         *block_num += 1;
         let tz = block_num.trailing_zeros() as usize;
@@ -277,6 +292,22 @@ impl AEctx {
         // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
         let oa = xor_block(offset, table_get(&self.L, tz));
         self.enc_block(oa, pt_ptr, ct_ptr, checksum);
+        oa
+    }
+
+    #[inline(always)]
+    fn dec_single_block_local(
+        &mut self,
+        ct_ptr: *const u8,
+        pt_ptr: *mut u8,
+        block_num: &mut u32,
+        offset: __m128i,
+        checksum: &mut __m128i,
+    ) -> __m128i {
+        *block_num += 1;
+        let tz = block_num.trailing_zeros() as usize;
+        let oa = xor_block(offset, table_get(&self.L, tz));
+        self.dec_block(oa, ct_ptr, pt_ptr, checksum);
         oa
     }
 
@@ -465,13 +496,14 @@ impl AEctx {
         }
         let io_len = io.len();
 
-        let (ct_ptr, pt_ptr) = match io {
+        let (mut ct_ptr, mut pt_ptr) = match io {
             DecryptIO::InPlace(buf) => (buf.as_ptr(), buf.as_mut_ptr()),
             DecryptIO::OutOfPlace { in_ct, out_pt } => (in_ct.as_ptr(), out_pt.as_mut_ptr()),
         };
 
         let num_bpi = (io_len - OCB_TAG_LEN as usize) / (BPI * 16);
-        let remaining = (io_len - OCB_TAG_LEN as usize) % (BPI * 16);
+        let mut full_blocks = num_bpi * BPI;
+        let mut remaining = (io_len - OCB_TAG_LEN as usize) % (BPI * 16);
 
         let l0 = self.L[0];
         let l1 = self.L[1];
@@ -480,6 +512,7 @@ impl AEctx {
         let mut offset = self.offset;
         let mut checksum = self.checksum;
 
+        // 8 blocks at once fully using all xmm registers, and the 2 parallel AES pipelines.
         for _ in 0..num_bpi {
             block_num += BPI as u32;
             let oa0 = xor_block(offset, l0);
@@ -537,6 +570,72 @@ impl AEctx {
             storeu_block_with_offset(pt_ptr, pt_hi[1], 80);
             storeu_block_with_offset(pt_ptr, pt_hi[2], 96);
             storeu_block_with_offset(pt_ptr, pt_hi[3], 112);
+
+            unsafe {
+                ct_ptr = ct_ptr.add(128);
+                pt_ptr = pt_ptr.add(128);
+            }
+        }
+
+        full_blocks %= BPI;
+
+        while full_blocks > 0 {
+            offset =
+                self.dec_single_block_local(ct_ptr, pt_ptr, &mut block_num, offset, &mut checksum);
+            unsafe {
+                ct_ptr = ct_ptr.add(16);
+                pt_ptr = pt_ptr.add(16);
+            }
+            full_blocks -= 1;
+            remaining -= 16;
+        }
+
+        // Tail decryption and tag verificattion
+        if remaining > 0 {
+            let ct0 = if ((ct_ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
+                let raw = loadu_block(ct_ptr as *const __m128i);
+                unsafe {
+                    _mm_or_si128(
+                        _mm_shuffle_epi8(raw, TAIL_LOAD_MASK.get(remaining)),
+                        TAIL_PAD_80.get(remaining),
+                    )
+                }
+            } else {
+                let mut tmp = [0u8; 16];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ct_ptr, tmp.as_mut_ptr(), remaining);
+                }
+                tmp[remaining] = 0x80;
+                loadu_block(tmp.as_ptr() as *const __m128i)
+            };
+            offset = xor_block(offset, self.lstar);
+            let ta = xor_block(offset, ct0);
+            let pad = self.decrypt_key.AES_decrypt_block(ta);
+            let pt = xor_block(ct0, pad);
+            checksum = xor_block(checksum, pt);
+            let old = loadu_block(pt_ptr as *const __m128i);
+            //SAFETY: blends the plaintext with the tag in the case of in-place decryption. In the
+            //case of out-of-place, we have the destination buffer to be pt_len + OCB_TAG_LEN size.
+            let blended = blendv_block(old, pt, TAIL_STORE_MASK.get(remaining));
+            storeu_block(pt_ptr as *mut __m128i, blended);
+            unsafe {
+                ct_ptr = ct_ptr.add(remaining);
+            }
+        }
+
+        let tag = loadu_block(ct_ptr as *const __m128i);
+        offset = xor_block(offset, self.ldollar);
+        checksum = xor_block(offset, checksum);
+        checksum = xor_block(checksum, self.ad_checksum);
+        // Unequal
+        if equal_blocks(checksum, tag) == 1 {
+            // Fill with 0 the whole destination.
+            // SAFETY: we have advanced pt_ptr by io_len bytes so far, we can revert it and
+            // write io_len bytes to it safely.
+            unsafe {
+                pt_ptr.sub(io_len).write_bytes(0, io_len);
+            }
+            return Err(crate::CryptoError::TagInvalid);
         }
 
         Ok(())

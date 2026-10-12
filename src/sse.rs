@@ -20,9 +20,14 @@ pub(crate) fn xor_block(a: __m128i, b: __m128i) -> __m128i {
     unsafe { _mm_xor_si128(a, b) }
 }
 
+/// Returns `1` if the two blocks are equal, `0` otherwise.
+/// SAFETY: requires SSE4.1
 #[inline(always)]
-pub(crate) fn unequal_blocks(a: __m128i, b: __m128i) -> bool {
-    unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) != 0xffff }
+pub(crate) fn equal_blocks(a: __m128i, b: __m128i) -> u8 {
+    unsafe {
+        let diff = _mm_xor_si128(a, b);
+        _mm_testz_si128(diff, diff) as u8
+    }
 }
 
 /// Unaligned load from a raw pointer. The caller must ensure that the 16 bytes at `a` are readable.

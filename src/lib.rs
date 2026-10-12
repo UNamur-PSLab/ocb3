@@ -44,13 +44,13 @@ impl<'a> EncryptIO<'a> {
         match self {
             Self::InPlace(in_pt) => {
                 if in_pt.len() < OCB_TAG_LEN as usize {
-                    return Err(CryptoError::DestinationUnfit);
+                    return Err(CryptoError::DestinationSizeUnfit);
                 }
                 Ok(())
             }
             Self::OutOfPlace { in_pt, out } => {
                 if in_pt.len() + OCB_TAG_LEN as usize > out.len() {
-                    return Err(CryptoError::DestinationUnfit);
+                    return Err(CryptoError::DestinationSizeUnfit);
                 }
                 Ok(())
             }
@@ -82,8 +82,8 @@ impl<'a> DecryptIO<'a> {
                     return Err(CryptoError::CiphertextTooSmall);
                 }
 
-                if out_pt.len() < in_ct.len().wrapping_sub(OCB_TAG_LEN as usize) {
-                    return Err(CryptoError::DestinationUnfit);
+                if (out_pt.len() + OCB_TAG_LEN as usize) < in_ct.len() {
+                    return Err(CryptoError::DestinationSizeUnfit);
                 }
             }
             Self::InPlace(in_ct) => {
@@ -114,7 +114,7 @@ pub enum CryptoError {
     #[error(
         "The size of the destination buffer does fit. It needs to be sufficient to hold the size of the plaintext plus the size of tag"
     )]
-    DestinationUnfit,
+    DestinationSizeUnfit,
     #[error("Bad tag observed during decryption")]
     TagInvalid,
     #[error("A provided option is unsupported")]
