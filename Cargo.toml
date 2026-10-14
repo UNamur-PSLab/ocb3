@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2.0.20"
+
+[[example]]
+name = "speed"
+path = "examples/speed.rs"
