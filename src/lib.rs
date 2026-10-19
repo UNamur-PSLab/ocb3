@@ -134,10 +134,7 @@ pub enum CryptoError {
 
 mod aes;
 pub mod ocb;
+pub use ocb::AEctx;
+
 #[cfg(target_arch = "x86_64")]
 mod sse;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

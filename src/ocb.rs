@@ -1,4 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
 use crate::DecryptIO;
 use crate::EncryptIO;
 use crate::OCB_TAG_LEN;
@@ -95,6 +94,7 @@ impl AEctx {
         }
     }
 
+    #[allow(clippy::pointers_in_nomem_asm_block)]
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
     unsafe fn process_ad(&self, ad: &[u8]) -> __m128i {
@@ -233,13 +233,7 @@ impl AEctx {
     }
 
     #[inline(always)]
-    fn enc_block(
-        &self,
-        oa: __m128i,
-        pt_ptr: *const u8,
-        ct_ptr: *mut u8,
-        checksum: &mut __m128i,
-    ) {
+    fn enc_block(&self, oa: __m128i, pt_ptr: *const u8, ct_ptr: *mut u8, checksum: &mut __m128i) {
         let pt = loadu_block(pt_ptr as *const __m128i);
         let t = xor_block(oa, pt);
         let ct = self.encrypt_key.AES_encrypt_block(t);
@@ -267,6 +261,7 @@ impl AEctx {
     /// Encrypts `num_bpi` groups of 8 blocks (`128` bytes each) starting at an 8-block aligned
     /// `block_num`. Uses all 16 XMM registers with zero stack spills via prewhitened offsets
     /// and a telescoping offset-whitened checksum.
+    #[allow(clippy::pointers_in_nomem_asm_block)]
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
     unsafe fn enc_bpi_loop(
@@ -286,9 +281,21 @@ impl AEctx {
             let tz = block_num.trailing_zeros() as usize;
             unsafe {
                 let mut l_ptr = self.L.as_ptr();
+
+                // l0, l1, l2 are loop invariant but must not be declared outside of the loop
+                // or the compiler considers them living through the whole loop as it should be,
+                // but that creates register pressure. Instead, we load them before we encrypt,
+                // and reload them again when needed after the encryption. This way, we never
+                // spill registers on the stack.
+                //
+                // The asm below is no-op, but prevents the compiler to put l0, l1, l2 outside of
+                // the loop. This is however brittle as it depends for the *current* compiler
+                // heuristics ...
+                // TODO Emit the whole loop as asm?
                 core::arch::asm!(
                     "/* {0} */",
                     inout(reg) l_ptr,
+                    // This asm does nothing, so tell the compiler.
                     options(pure, nomem, nostack, preserves_flags)
                 );
                 let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
@@ -327,6 +334,7 @@ impl AEctx {
                     "/* {0} {1} */",
                     inout(xmm_reg) checksum,
                     inout(reg) rk_ptr,
+                    // This asm does nothing, so tell the compiler.
                     options(pure, nomem, nostack, preserves_flags)
                 );
 
@@ -335,6 +343,8 @@ impl AEctx {
                     [b0, b1, b2, b3, b4, b5, b6, b7],
                 );
 
+                // Reloading l0, l1, l2 again, reusing registers, and heuristically
+                // preventing LLVM to move these variables outside of the loop.
                 let mut l_ptr2 = self.L.as_ptr();
                 core::arch::asm!(
                     "/* {0} */",
@@ -375,6 +385,7 @@ impl AEctx {
 
     /// Decrypts `num_bpi` groups of 8 blocks (`128` bytes each) in lockstep using all 16 XMM
     /// registers and both AES pipelines.
+    #[allow(clippy::pointers_in_nomem_asm_block)]
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
     unsafe fn dec_bpi_loop(
@@ -396,6 +407,7 @@ impl AEctx {
                 core::arch::asm!(
                     "/* {0} */",
                     inout(reg) l_ptr,
+                    // This asm does nothing, so tell the compiler.
                     options(pure, nomem, nostack, preserves_flags)
                 );
                 let mut rk_ptr = self.decrypt_key.rd_key.as_ptr();
@@ -825,7 +837,11 @@ impl AEctx {
             let (mut pt_ptr, mut ct_ptr, pt_len) = match io {
                 EncryptIO::InPlace(buf) => {
                     // The buffer holds the plaintext followed by a 16-byte tag slot.
-                    (buf.as_ptr(), buf.as_mut_ptr(), buf.len() - OCB_TAG_LEN as usize)
+                    (
+                        buf.as_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len() - OCB_TAG_LEN as usize,
+                    )
                 }
                 EncryptIO::OutOfPlace {
                     in_pt: PlainText::Contiguous(pt),
@@ -939,8 +955,7 @@ impl AEctx {
                 &mut checksum,
             );
             if rem > 0 {
-                (ct_ptr, offset, checksum) =
-                    self.enc_tail(pt_ptr, rem, ct_ptr, offset, checksum);
+                (ct_ptr, offset, checksum) = self.enc_tail(pt_ptr, rem, ct_ptr, offset, checksum);
             }
             self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
         }
@@ -956,7 +971,7 @@ mod tests {
     // These tests were generated using Qwen-3.8-27B on local hardware, feeding the LLM
     // with the output test vectors of the original C implementation, and asking it to exercice
     // our InPlace/OutOfPLace and Scattered API on the test vectors.
-    
+
     include!("test_vectors/spec_vectors.rs");
     /// Spec test data: pt[i] = ad[i] = i.
     fn spec_data(len: usize) -> Vec<u8> {
