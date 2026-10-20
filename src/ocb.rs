@@ -16,7 +16,7 @@ const PAGE_OFFSET_MASK: usize = PAGE_SIZE_4K - 1;
 pub struct AEctx {
     lstar: __m128i,
     ldollar: __m128i,
-    L: [__m128i; L_TABLE_SZ],
+    l: [__m128i; L_TABLE_SZ],
     cached_top: __m128i,
     decrypt_key: AesKey,
     encrypt_key: AesKey,
@@ -36,7 +36,7 @@ impl AEctx {
         let mut ctx = AEctx {
             lstar: zero,
             ldollar: zero,
-            L: [zero; L_TABLE_SZ],
+            l: [zero; L_TABLE_SZ],
             cached_top: zero,
             decrypt_key: AesKey::default(),
             encrypt_key: AesKey::default(),
@@ -44,18 +44,18 @@ impl AEctx {
         };
 
         // Key dependent values
-        ctx.encrypt_key.AES_128_key_expansion(key);
-        ctx.decrypt_key.AES_set_key_fast(&ctx.encrypt_key);
-        ctx.lstar = ctx.encrypt_key.AES_encrypt_block(ctx.cached_top);
+        ctx.encrypt_key.aes_128_key_expansion(key);
+        ctx.decrypt_key.aes_set_key_fast(&ctx.encrypt_key);
+        ctx.lstar = ctx.encrypt_key.aes_encrypt_block(ctx.cached_top);
         let mut tmp_blk = swap_if_le(ctx.lstar);
         tmp_blk = double(tmp_blk);
         ctx.ldollar = swap_if_le(tmp_blk);
         tmp_blk = double(tmp_blk);
-        ctx.L[0] = swap_if_le(tmp_blk);
+        ctx.l[0] = swap_if_le(tmp_blk);
 
         for i in 1..L_TABLE_SZ {
             tmp_blk = double(tmp_blk);
-            ctx.L[i] = swap_if_le(tmp_blk);
+            ctx.l[i] = swap_if_le(tmp_blk);
         }
 
         ctx
@@ -71,7 +71,7 @@ impl AEctx {
         let mut bl = unsafe { _mm_set_epi64x(hi_qword as i64, lo_qword as i64) };
         if equal_blocks(bl, self.cached_top) == 0 {
             self.cached_top = bl;
-            bl = self.encrypt_key.AES_encrypt_block(bl);
+            bl = self.encrypt_key.aes_encrypt_block(bl);
             [self.ktop_str[0], self.ktop_str[1]] = m128i_to_bswap_u64x2(bl);
             self.ktop_str[2] =
                 self.ktop_str[0] ^ (self.ktop_str[0] << 8) ^ (self.ktop_str[1] >> 56);
@@ -107,7 +107,8 @@ impl AEctx {
         for _ in 0..num_bpi {
             ad_blocks_num += BPI;
             let tz = ad_blocks_num.trailing_zeros() as usize;
-            let mut l_ptr = self.L.as_ptr();
+            let mut l_ptr = self.l.as_ptr();
+            // Keep l_ptr in register.
             unsafe {
                 core::arch::asm!(
                     "/* {0} */",
@@ -131,7 +132,7 @@ impl AEctx {
             let oa4_k = xor_block(oa1_k, l2);
             let oa5_k = xor_block(oa0_k, l2);
             let oa6_k = xor_block(offset_k, l2);
-            // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.L`.
+            // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.l`.
             let l_tz = unsafe {
                 *l_ptr.add(tz)
             };
@@ -156,7 +157,7 @@ impl AEctx {
                 );
             }
 
-            let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
+            let ct = AesKey::aes_encrypt_8_blocks_prewhitened(
                 rk_ptr,
                 [b0, b1, b2, b3, b4, b5, b6, b7],
             );
@@ -169,9 +170,9 @@ impl AEctx {
             }
         }
 
-        let l0 = self.L[0];
-        let l1 = self.L[1];
-        let l2 = self.L[2];
+        let l0 = self.l[0];
+        let l1 = self.l[1];
+        let l2 = self.l[2];
         let mut remaining = ad.len() % (BPI * 16);
         if remaining >= 64 {
             let oa0 = xor_block(ad_offset, l0);
@@ -185,7 +186,7 @@ impl AEctx {
             let ad2 = loadu_block_with_offset(ad_ptr, 32);
             let ad3 = loadu_block_with_offset(ad_ptr, 48);
 
-            let ct = self.encrypt_key.AES_encrypt_4_blocks([
+            let ct = self.encrypt_key.aes_encrypt_4_blocks([
                 xor_block(oa0, ad0),
                 xor_block(oa1, ad1),
                 xor_block(oa2, ad2),
@@ -209,7 +210,7 @@ impl AEctx {
             let ad1 = loadu_block_with_offset(ad_ptr, 16);
             let ct = self
                 .encrypt_key
-                .AES_encrypt_2_blocks([xor_block(oa0, ad0), xor_block(oa1, ad1)]);
+                .aes_encrypt_2_blocks([xor_block(oa0, ad0), xor_block(oa1, ad1)]);
             ad_checksum = xor_block(ad_checksum, xor_block(ct[0], ct[1]));
             // SAFETY: in range since remaining >= 32
             unsafe {
@@ -221,7 +222,7 @@ impl AEctx {
             ad_offset = xor_block(ad_offset, l0);
             let ad0 = loadu_block(ad_ptr as *const __m128i);
             let ta0 = xor_block(ad_offset, ad0);
-            let ct = self.encrypt_key.AES_encrypt_block(ta0);
+            let ct = self.encrypt_key.aes_encrypt_block(ta0);
             ad_checksum = xor_block(ad_checksum, ct);
             // SAFETY: in range since remaining >= 16
             unsafe {
@@ -231,10 +232,10 @@ impl AEctx {
         }
         if remaining > 0 {
             let mask = TAIL_STORE_MASK.get(remaining);
-            let ad0 = unsafe { Self::load_tail_padded(ad_ptr, remaining, mask) };
+            let ad0 = Self::load_tail_padded(ad_ptr, remaining, mask);
             ad_offset = xor_block(ad_offset, self.lstar);
             let ta = xor_block(ad_offset, ad0);
-            let ct = self.encrypt_key.AES_encrypt_block(ta);
+            let ct = self.encrypt_key.aes_encrypt_block(ta);
             ad_checksum = xor_block(ad_checksum, ct);
         }
         ad_checksum
@@ -244,7 +245,7 @@ impl AEctx {
     fn enc_block(&self, oa: __m128i, pt_ptr: *const u8, ct_ptr: *mut u8, checksum: &mut __m128i) {
         let pt = loadu_block(pt_ptr as *const __m128i);
         let t = xor_block(oa, pt);
-        let ct = self.encrypt_key.AES_encrypt_block(t);
+        let ct = self.encrypt_key.aes_encrypt_block(t);
         storeu_block(ct_ptr as *mut __m128i, xor_block(ct, oa));
         *checksum = xor_block(*checksum, pt);
     }
@@ -260,8 +261,8 @@ impl AEctx {
     ) -> __m128i {
         *block_num += 1;
         let tz = block_num.trailing_zeros() as usize;
-        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
-        let oa = xor_block(offset, table_get(&self.L, tz));
+        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.l`.
+        let oa = xor_block(offset, table_get(&self.l, tz));
         self.enc_block(oa, pt_ptr, ct_ptr, checksum);
         oa
     }
@@ -287,7 +288,7 @@ impl AEctx {
         for _ in 0..num_bpi {
             block_num += BPI as u32;
             let tz = block_num.trailing_zeros() as usize;
-            let mut l_ptr = self.L.as_ptr();
+            let mut l_ptr = self.l.as_ptr();
             unsafe {
                 // l0, l1, l2 are loop invariant but must not be declared outside of the loop
                 // or the compiler considers them living through the whole loop as it should be,
@@ -321,7 +322,7 @@ impl AEctx {
             let oa4_k = xor_block(oa1_k, l2);
             let oa5_k = xor_block(oa0_k, l2);
             let oa6_k = xor_block(ok, l2);
-            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds for `self.L`.
+            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds for `self.l`.
             let l_tz = unsafe {
                 *l_ptr.add(tz)
             };
@@ -350,14 +351,14 @@ impl AEctx {
                 );
             }
 
-            let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
+            let ct = AesKey::aes_encrypt_8_blocks_prewhitened(
                 rk_ptr,
                 [b0, b1, b2, b3, b4, b5, b6, b7],
             );
 
             // Reloading l0, l1, l2 again, reusing registers, and heuristically
             // preventing LLVM to move these variables outside of the loop.
-            let mut l_ptr2 = self.L.as_ptr();
+            let mut l_ptr2 = self.l.as_ptr();
             unsafe {
                 core::arch::asm!(
                     "/* {0} */",
@@ -420,7 +421,7 @@ impl AEctx {
         for _ in 0..num_bpi {
             block_num += BPI as u32;
             let tz = block_num.trailing_zeros() as usize;
-            let mut l_ptr = self.L.as_ptr();
+            let mut l_ptr = self.l.as_ptr();
             // Same as in enc_bpi_loop; we try to prevent LLVM
             // to move loop independent variables up the loop.
             unsafe {
@@ -447,7 +448,7 @@ impl AEctx {
             let oa5_k = xor_block(oa0_k, l2);
             let oa6_k = xor_block(ok, l2);
             // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16`
-            // and in-bounds for `self.L`.
+            // and in-bounds for `self.l`.
             let l_tz = unsafe {
                 *l_ptr.add(tz)
             };
@@ -473,7 +474,7 @@ impl AEctx {
                 );
             }
 
-            let d = AesKey::AES_decrypt_8_blocks_prewhitened(
+            let d = AesKey::aes_decrypt_8_blocks_prewhitened(
                 rk_ptr,
                 [b0, b1, b2, b3, b4, b5, b6, b7],
             );
@@ -482,7 +483,7 @@ impl AEctx {
             let sum1 = xor_block(xor_block(d[4], d[5]), xor_block(d[6], d[7]));
             checksum = xor_block(checksum, xor_block(sum0, sum1));
 
-            let mut l_ptr2 = self.L.as_ptr();
+            let mut l_ptr2 = self.l.as_ptr();
             unsafe {
                 core::arch::asm!(
                     "/* {0} */",
@@ -552,9 +553,9 @@ impl AEctx {
         let mut rem_blocks = full_blocks % BPI;
         *block_num += rem_blocks as u32;
 
-        let l0 = self.L[0];
-        let l1 = self.L[1];
-        let l2 = self.L[2];
+        let l0 = self.l[0];
+        let l1 = self.l[1];
+        let l2 = self.l[2];
 
         if rem_blocks >= 4 {
             let oa0 = xor_block(offset, l0);
@@ -571,7 +572,7 @@ impl AEctx {
             let pt_sum = xor_block(xor_block(pt0, pt1), xor_block(pt2, pt3));
             *checksum = xor_block(*checksum, pt_sum);
 
-            let ct = self.encrypt_key.AES_encrypt_4_blocks([
+            let ct = self.encrypt_key.aes_encrypt_4_blocks([
                 xor_block(oa0, pt0),
                 xor_block(oa1, pt1),
                 xor_block(oa2, pt2),
@@ -600,7 +601,7 @@ impl AEctx {
 
             let ct = self
                 .encrypt_key
-                .AES_encrypt_2_blocks([xor_block(oa0, pt0), xor_block(oa1, pt1)]);
+                .aes_encrypt_2_blocks([xor_block(oa0, pt0), xor_block(oa1, pt1)]);
 
             storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
             storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
@@ -667,7 +668,7 @@ impl AEctx {
         let pt_padded = Self::load_tail_padded(data_ptr, data_len, mask);
         let checksum = xor_block(checksum, pt_padded);
         let offset = xor_block(offset, self.lstar);
-        let pad = self.encrypt_key.AES_encrypt_block(offset);
+        let pad = self.encrypt_key.aes_encrypt_block(offset);
         let ct_block = xor_block(pt_padded, pad);
 
         //SAFETY: the ciphertext slice is required to be 16 bytes longer than the plaintext, so
@@ -690,7 +691,7 @@ impl AEctx {
         ad: &[u8],
     ) {
         let t = xor_block(xor_block(offset, self.ldollar), checksum);
-        let mut tag = self.encrypt_key.AES_encrypt_block(t);
+        let mut tag = self.encrypt_key.aes_encrypt_block(t);
         if !ad.is_empty() {
             unsafe {
                 tag = xor_block(tag, self.process_ad(ad));
@@ -732,9 +733,9 @@ impl AEctx {
         }
 
         // Leftover full blocks (0..7) after the 8-block groups.
-        let l0 = self.L[0];
-        let l1 = self.L[1];
-        let l2 = self.L[2];
+        let l0 = self.l[0];
+        let l1 = self.l[1];
+        let l2 = self.l[2];
         let mut full_blocks = (pt_len % (BPI * 16)) / 16;
 
         if full_blocks >= 4 {
@@ -749,7 +750,7 @@ impl AEctx {
             let ct2 = loadu_block_with_offset(ct_ptr, 32);
             let ct3 = loadu_block_with_offset(ct_ptr, 48);
 
-            let d = self.decrypt_key.AES_decrypt_4_blocks([
+            let d = self.decrypt_key.aes_decrypt_4_blocks([
                 xor_block(oa0, ct0),
                 xor_block(oa1, ct1),
                 xor_block(oa2, ct2),
@@ -785,7 +786,7 @@ impl AEctx {
 
             let d = self
                 .decrypt_key
-                .AES_decrypt_2_blocks([xor_block(oa0, ct0), xor_block(oa1, ct1)]);
+                .aes_decrypt_2_blocks([xor_block(oa0, ct0), xor_block(oa1, ct1)]);
 
             let p0 = xor_block(d[0], oa0);
             let p1 = xor_block(d[1], oa1);
@@ -803,7 +804,7 @@ impl AEctx {
         if full_blocks >= 1 {
             offset = xor_block(offset, l0);
             let ct = loadu_block(ct_ptr as *const __m128i);
-            let d = self.decrypt_key.AES_decrypt_block(xor_block(offset, ct));
+            let d = self.decrypt_key.aes_decrypt_block(xor_block(offset, ct));
             let pt = xor_block(d, offset);
             storeu_block(pt_ptr as *mut __m128i, pt);
             checksum = xor_block(checksum, pt);
@@ -820,7 +821,7 @@ impl AEctx {
             // always in-bounds of the input slice.
             let raw = loadu_block(ct_ptr as *const __m128i);
             offset = xor_block(offset, self.lstar);
-            let pad = self.encrypt_key.AES_encrypt_block(offset);
+            let pad = self.encrypt_key.aes_encrypt_block(offset);
             let mask = TAIL_STORE_MASK.get(remaining);
             let pt_zero_padded = _mm_and_si128(xor_block(raw, pad), mask);
             let pt_padded = _mm_or_si128(pt_zero_padded, TAIL_PAD_80.get(remaining));
@@ -839,7 +840,7 @@ impl AEctx {
         // Tag verification: `T = E_K((offset ^ L$) ^ checksum) ^ ad_checksum`.
         let tag = loadu_block(ct_ptr as *const __m128i);
         let mut t = xor_block(xor_block(offset, self.ldollar), checksum);
-        t = self.encrypt_key.AES_encrypt_block(t);
+        t = self.encrypt_key.aes_encrypt_block(t);
         if !ad.is_empty() {
             t = xor_block(t, self.process_ad(ad));
         }

@@ -35,7 +35,7 @@ unsafe fn expand_step<const RCON: i32>(mut t1: __m128i) -> __m128i {
 
 impl AesKey {
     #[inline(always)]
-    pub(crate) fn AES_128_key_expansion(&mut self, userkey: &[u8]) {
+    pub(crate) fn aes_128_key_expansion(&mut self, userkey: &[u8]) {
         unsafe {
             let mut x0 = _mm_loadu_si128(userkey.as_ptr() as *const __m128i);
             self.rd_key[0] = x0;
@@ -63,7 +63,7 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_set_key_fast(&mut self, other: &AesKey) {
+    pub(crate) fn aes_set_key_fast(&mut self, other: &AesKey) {
         unsafe {
             self.rd_key[10] = other.rd_key[0];
             self.rd_key[9] = _mm_aesimc_si128(other.rd_key[1]);
@@ -81,7 +81,7 @@ impl AesKey {
 
     /// AES encrypt on unaligned in/out memory. On modern processors, unaligned
     #[inline(always)]
-    pub(crate) fn AES_encrypt_block(&self, mut in_pt: __m128i) -> __m128i {
+    pub(crate) fn aes_encrypt_block(&self, mut in_pt: __m128i) -> __m128i {
         unsafe {
             let rnds = 10;
             in_pt = _mm_xor_si128(in_pt, self.rd_key[0]);
@@ -93,7 +93,7 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_encrypt_2_blocks(&self, mut b: [__m128i; 2]) -> [__m128i; 2] {
+    pub(crate) fn aes_encrypt_2_blocks(&self, mut b: [__m128i; 2]) -> [__m128i; 2] {
         unsafe {
             let k0 = self.rd_key[0];
             b[0] = _mm_xor_si128(b[0], k0);
@@ -114,7 +114,7 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_encrypt_4_blocks(&self, mut b: [__m128i; 4]) -> [__m128i; 4] {
+    pub(crate) fn aes_encrypt_4_blocks(&self, mut b: [__m128i; 4]) -> [__m128i; 4] {
         unsafe {
             let k0 = self.rd_key[0];
             b[0] = _mm_xor_si128(b[0], k0);
@@ -144,7 +144,7 @@ impl AesKey {
     /// Passing `rk` as a pointer prevents LLVM's LICM from hoisting all 10 round keys into
     /// virtual registers across loop iterations, keeping total live XMM registers <= 16.
     #[inline(always)]
-    pub(crate) fn AES_encrypt_8_blocks_prewhitened(
+    pub(crate) fn aes_encrypt_8_blocks_prewhitened(
         rk: *const __m128i,
         mut b: [__m128i; 8],
     ) -> [__m128i; 8] {
@@ -176,7 +176,7 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_decrypt_2_blocks(&self, mut b: [__m128i; 2]) -> [__m128i; 2] {
+    pub(crate) fn aes_decrypt_2_blocks(&self, mut b: [__m128i; 2]) -> [__m128i; 2] {
         unsafe {
             let k0 = self.rd_key[0];
             b[0] = _mm_xor_si128(b[0], k0);
@@ -197,7 +197,7 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_decrypt_4_blocks(&self, mut b: [__m128i; 4]) -> [__m128i; 4] {
+    pub(crate) fn aes_decrypt_4_blocks(&self, mut b: [__m128i; 4]) -> [__m128i; 4] {
         unsafe {
             let k0 = self.rd_key[0];
             b[0] = _mm_xor_si128(b[0], k0);
@@ -225,7 +225,7 @@ impl AesKey {
 
     /// Decrypts 8 blocks in lockstep where `b[0..8]` have already been XORed with `rd_key[0]`.
     #[inline(always)]
-    pub(crate) fn AES_decrypt_8_blocks_prewhitened(
+    pub(crate) fn aes_decrypt_8_blocks_prewhitened(
         rk: *const __m128i,
         mut b: [__m128i; 8],
     ) -> [__m128i; 8] {
@@ -257,7 +257,7 @@ impl AesKey {
     }
 
     #[inline(always)]
-    pub(crate) fn AES_decrypt_block(&self, mut in_ct: __m128i) -> __m128i {
+    pub(crate) fn aes_decrypt_block(&self, mut in_ct: __m128i) -> __m128i {
         unsafe {
             let rnds = 10;
             in_ct = _mm_xor_si128(in_ct, self.rd_key[0]);

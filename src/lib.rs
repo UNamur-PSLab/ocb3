@@ -32,6 +32,14 @@ impl<'a> PlainText<'a> {
             Self::Scattered(pt1, pt2) => pt1.len() + pt2.len(),
         }
     }
+    
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Contiguous(buf) => buf.is_empty(),
+            Self::Scattered(pt1, pt2) => pt1.is_empty() && pt2.is_empty(),
+        }
+    }
 }
 
 impl<'a> EncryptIO<'a> {
@@ -66,6 +74,14 @@ impl<'a> EncryptIO<'a> {
         match self {
             Self::InPlace(buf) => buf.len().saturating_sub(OCB_TAG_LEN as usize),
             Self::OutOfPlace { in_pt, .. } => in_pt.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::InPlace(buf) => buf.is_empty(),
+            Self::OutOfPlace { in_pt, .. } => in_pt.is_empty(),
         }
     }
 }
