@@ -402,8 +402,8 @@ impl AEctx {
         (offset, checksum)
     }
 
-    /// Decrypts `num_bpi` groups of 8 blocks (`128` bytes each) in lockstep using all 16 XMM
-    /// registers and both AES pipelines.
+    /// Decrypts `num_bpi` groups of 8 blocks (`128` bytes each) using all 16 XMM
+    /// registers
     #[allow(clippy::pointers_in_nomem_asm_block)]
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
@@ -528,7 +528,7 @@ impl AEctx {
     }
 
     /// Encrypts `full_blocks` starting from an 8-block aligned `block_num`, using the 8-block
-    /// lockstep loop followed by `4 -> 2 -> 1` parallel leftover blocks with constant offsets.
+    /// loop followed by `4 -> 2 -> 1` parallel leftover blocks with constant offsets.
     #[inline(always)]
     fn enc_aligned_blocks(
         &self,
@@ -856,7 +856,14 @@ impl AEctx {
 
         Ok(())
     }
-
+    
+    /// Encrypt `io` using `nonce` and associated data `ad`. This function is atomic, and depending
+    /// on `io`, it does in place encryption and then appends a tag, or out of place encryption and
+    /// then appends a tag.
+    ///
+    /// Note that `io` may contain a scattered plaintext of two &[u8] for the out of place
+    /// encryption. This is designed for encrypted transports encrypting protocol-level control
+    /// information and application-level data.
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
