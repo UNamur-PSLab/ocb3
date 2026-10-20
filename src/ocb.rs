@@ -81,7 +81,7 @@ impl AEctx {
     }
 
     #[inline(always)]
-    unsafe fn load_tail_padded(ptr: *const u8, len: usize, mask: __m128i) -> __m128i {
+    fn load_tail_padded(ptr: *const u8, len: usize, mask: __m128i) -> __m128i {
         // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
         // within the same page, overreading partial bytes cannot cross into an unmapped
         // page and will never cause a page fault. Otherwise we safely copy up to page
@@ -90,14 +90,14 @@ impl AEctx {
             let raw = loadu_block(ptr as *const __m128i);
             unsafe { _mm_or_si128(_mm_and_si128(raw, mask), TAIL_PAD_80.get(len)) }
         } else {
-            unsafe { load_padded_tail_cold(ptr, len) }
+            load_padded_tail_cold(ptr, len)
         }
     }
 
     #[allow(clippy::pointers_in_nomem_asm_block)]
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
-    unsafe fn process_ad(&self, ad: &[u8]) -> __m128i {
+    fn process_ad(&self, ad: &[u8]) -> __m128i {
         let num_bpi = ad.len() / (BPI * 16);
         let mut ad_blocks_num: usize = 0;
         let mut ad_ptr = ad.as_ptr();
@@ -107,56 +107,64 @@ impl AEctx {
         for _ in 0..num_bpi {
             ad_blocks_num += BPI;
             let tz = ad_blocks_num.trailing_zeros() as usize;
+            let mut l_ptr = self.L.as_ptr();
             unsafe {
-                let mut l_ptr = self.L.as_ptr();
                 core::arch::asm!(
                     "/* {0} */",
                     inout(reg) l_ptr,
                     options(pure, nomem, nostack, preserves_flags)
                 );
-                let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
-                let k0 = _mm_load_si128(rk_ptr);
-                let l0 = _mm_load_si128(l_ptr);
-                let l1 = _mm_load_si128(l_ptr.add(1));
-                let l2 = _mm_load_si128(l_ptr.add(2));
+            }
+            let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
+            let k0 = load_block(rk_ptr);
+            let l0 = load_block(l_ptr);
+            // SAFETY: self.l contains 16 elements; we are accessing the first 3.
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
+            };
 
-                let offset_k = xor_block(ad_offset, k0);
-                let oa0_k = xor_block(offset_k, l0);
-                let oa1_k = xor_block(oa0_k, l1);
-                let oa2_k = xor_block(offset_k, l1);
-                let oa3_k = xor_block(oa2_k, l2);
-                let oa4_k = xor_block(oa1_k, l2);
-                let oa5_k = xor_block(oa0_k, l2);
-                let oa6_k = xor_block(offset_k, l2);
-                // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.L`.
-                let l_tz = *l_ptr.add(tz);
-                ad_offset = xor_block(xor_block(ad_offset, l2), l_tz);
-                let oa7_k = xor_block(oa6_k, l_tz);
+            let offset_k = xor_block(ad_offset, k0);
+            let oa0_k = xor_block(offset_k, l0);
+            let oa1_k = xor_block(oa0_k, l1);
+            let oa2_k = xor_block(offset_k, l1);
+            let oa3_k = xor_block(oa2_k, l2);
+            let oa4_k = xor_block(oa1_k, l2);
+            let oa5_k = xor_block(oa0_k, l2);
+            let oa6_k = xor_block(offset_k, l2);
+            // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.L`.
+            let l_tz = unsafe {
+                *l_ptr.add(tz)
+            };
+            ad_offset = xor_block(xor_block(ad_offset, l2), l_tz);
+            let oa7_k = xor_block(oa6_k, l_tz);
 
-                let b0 = xor_block(oa0_k, loadu_block(ad_ptr as *const __m128i));
-                let b1 = xor_block(oa1_k, loadu_block_with_offset(ad_ptr, 16));
-                let b2 = xor_block(oa2_k, loadu_block_with_offset(ad_ptr, 32));
-                let b3 = xor_block(oa3_k, loadu_block_with_offset(ad_ptr, 48));
-                let b4 = xor_block(oa4_k, loadu_block_with_offset(ad_ptr, 64));
-                let b5 = xor_block(oa5_k, loadu_block_with_offset(ad_ptr, 80));
-                let b6 = xor_block(oa6_k, loadu_block_with_offset(ad_ptr, 96));
-                let b7 = xor_block(oa7_k, loadu_block_with_offset(ad_ptr, 112));
+            let b0 = xor_block(oa0_k, loadu_block(ad_ptr as *const __m128i));
+            let b1 = xor_block(oa1_k, loadu_block_with_offset(ad_ptr, 16));
+            let b2 = xor_block(oa2_k, loadu_block_with_offset(ad_ptr, 32));
+            let b3 = xor_block(oa3_k, loadu_block_with_offset(ad_ptr, 48));
+            let b4 = xor_block(oa4_k, loadu_block_with_offset(ad_ptr, 64));
+            let b5 = xor_block(oa5_k, loadu_block_with_offset(ad_ptr, 80));
+            let b6 = xor_block(oa6_k, loadu_block_with_offset(ad_ptr, 96));
+            let b7 = xor_block(oa7_k, loadu_block_with_offset(ad_ptr, 112));
 
+            unsafe {
                 core::arch::asm!(
                     "/* {0} {1} */",
                     inout(xmm_reg) ad_offset,
                     inout(reg) rk_ptr,
-                    options(pure, nomem, nostack, preserves_flags)
+                        options(pure, nomem, nostack, preserves_flags)
                 );
+            }
 
-                let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
-                    rk_ptr,
-                    [b0, b1, b2, b3, b4, b5, b6, b7],
-                );
-                let sum0 = xor_block(xor_block(ct[0], ct[1]), xor_block(ct[2], ct[3]));
-                let sum1 = xor_block(xor_block(ct[4], ct[5]), xor_block(ct[6], ct[7]));
-                ad_checksum = xor_block(ad_checksum, xor_block(sum0, sum1));
+            let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
+                rk_ptr,
+                [b0, b1, b2, b3, b4, b5, b6, b7],
+            );
+            let sum0 = xor_block(xor_block(ct[0], ct[1]), xor_block(ct[2], ct[3]));
+            let sum1 = xor_block(xor_block(ct[4], ct[5]), xor_block(ct[6], ct[7]));
+            ad_checksum = xor_block(ad_checksum, xor_block(sum0, sum1));
 
+            unsafe {
                 ad_ptr = ad_ptr.add(128);
             }
         }
@@ -279,9 +287,8 @@ impl AEctx {
         for _ in 0..num_bpi {
             block_num += BPI as u32;
             let tz = block_num.trailing_zeros() as usize;
+            let mut l_ptr = self.L.as_ptr();
             unsafe {
-                let mut l_ptr = self.L.as_ptr();
-
                 // l0, l1, l2 are loop invariant but must not be declared outside of the loop
                 // or the compiler considers them living through the whole loop as it should be,
                 // but that creates register pressure. Instead, we load them before we encrypt,
@@ -298,38 +305,42 @@ impl AEctx {
                     // This asm does nothing, so tell the compiler.
                     options(pure, nomem, nostack, preserves_flags)
                 );
-                let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
-                let k0 = _mm_load_si128(rk_ptr);
-                let l0 = _mm_load_si128(l_ptr);
-                let l1 = _mm_load_si128(l_ptr.add(1));
-                let l2 = _mm_load_si128(l_ptr.add(2));
+            }
+            let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
+            let k0 = load_block(rk_ptr);
+            let l0 = load_block(l_ptr);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
+            };
 
-                let ok = xor_block(offset, k0);
-                let oa0_k = xor_block(ok, l0);
-                let oa1_k = xor_block(oa0_k, l1);
-                let oa2_k = xor_block(ok, l1);
-                let oa3_k = xor_block(oa2_k, l2);
-                let oa4_k = xor_block(oa1_k, l2);
-                let oa5_k = xor_block(oa0_k, l2);
-                let oa6_k = xor_block(ok, l2);
-                // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds for `self.L`.
-                let l_tz = *l_ptr.add(tz);
-                let oa7_k = xor_block(oa6_k, l_tz);
+            let ok = xor_block(offset, k0);
+            let oa0_k = xor_block(ok, l0);
+            let oa1_k = xor_block(oa0_k, l1);
+            let oa2_k = xor_block(ok, l1);
+            let oa3_k = xor_block(oa2_k, l2);
+            let oa4_k = xor_block(oa1_k, l2);
+            let oa5_k = xor_block(oa0_k, l2);
+            let oa6_k = xor_block(ok, l2);
+            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds for `self.L`.
+            let l_tz = unsafe {
+                *l_ptr.add(tz)
+            };
+            let oa7_k = xor_block(oa6_k, l_tz);
 
-                let b0 = xor_block(oa0_k, loadu_block(pt_ptr as *const __m128i));
-                let b1 = xor_block(oa1_k, loadu_block_with_offset(pt_ptr, 16));
-                let b2 = xor_block(oa2_k, loadu_block_with_offset(pt_ptr, 32));
-                let b3 = xor_block(oa3_k, loadu_block_with_offset(pt_ptr, 48));
-                let b4 = xor_block(oa4_k, loadu_block_with_offset(pt_ptr, 64));
-                let b5 = xor_block(oa5_k, loadu_block_with_offset(pt_ptr, 80));
-                let b6 = xor_block(oa6_k, loadu_block_with_offset(pt_ptr, 96));
-                let b7 = xor_block(oa7_k, loadu_block_with_offset(pt_ptr, 112));
+            let b0 = xor_block(oa0_k, loadu_block(pt_ptr as *const __m128i));
+            let b1 = xor_block(oa1_k, loadu_block_with_offset(pt_ptr, 16));
+            let b2 = xor_block(oa2_k, loadu_block_with_offset(pt_ptr, 32));
+            let b3 = xor_block(oa3_k, loadu_block_with_offset(pt_ptr, 48));
+            let b4 = xor_block(oa4_k, loadu_block_with_offset(pt_ptr, 64));
+            let b5 = xor_block(oa5_k, loadu_block_with_offset(pt_ptr, 80));
+            let b6 = xor_block(oa6_k, loadu_block_with_offset(pt_ptr, 96));
+            let b7 = xor_block(oa7_k, loadu_block_with_offset(pt_ptr, 112));
 
-                // Telescoping checksum: b0 ^ .. ^ b7 == (pt0 ^ .. ^ pt7) ^ offset ^ oa7.
-                let sum0 = xor_block(xor_block(b0, b1), xor_block(b2, b3));
-                let sum1 = xor_block(xor_block(b4, b5), xor_block(b6, b7));
-                checksum = xor_block(checksum, xor_block(sum0, sum1));
-
+            // Telescoping checksum: b0 ^ .. ^ b7 == (pt0 ^ .. ^ pt7) ^ offset ^ oa7.
+            let sum0 = xor_block(xor_block(b0, b1), xor_block(b2, b3));
+            let sum1 = xor_block(xor_block(b4, b5), xor_block(b6, b7));
+            checksum = xor_block(checksum, xor_block(sum0, sum1));
+            unsafe {
                 core::arch::asm!(
                     "/* {0} {1} */",
                     inout(xmm_reg) checksum,
@@ -337,43 +348,50 @@ impl AEctx {
                     // This asm does nothing, so tell the compiler.
                     options(pure, nomem, nostack, preserves_flags)
                 );
+            }
 
-                let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
-                    rk_ptr,
-                    [b0, b1, b2, b3, b4, b5, b6, b7],
-                );
+            let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
+                rk_ptr,
+                [b0, b1, b2, b3, b4, b5, b6, b7],
+            );
 
-                // Reloading l0, l1, l2 again, reusing registers, and heuristically
-                // preventing LLVM to move these variables outside of the loop.
-                let mut l_ptr2 = self.L.as_ptr();
+            // Reloading l0, l1, l2 again, reusing registers, and heuristically
+            // preventing LLVM to move these variables outside of the loop.
+            let mut l_ptr2 = self.L.as_ptr();
+            unsafe {
                 core::arch::asm!(
                     "/* {0} */",
                     inout(reg) l_ptr2,
                     options(pure, nomem, nostack, preserves_flags)
                 );
-                let l0 = _mm_load_si128(l_ptr2);
-                let l1 = _mm_load_si128(l_ptr2.add(1));
-                let l2 = _mm_load_si128(l_ptr2.add(2));
+            }
+            let l0 = load_block(l_ptr2);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2)))
+            };
 
-                let oa0 = xor_block(offset, l0);
-                let oa1 = xor_block(oa0, l1);
-                let oa2 = xor_block(offset, l1);
-                let oa3 = xor_block(oa2, l2);
-                let oa4 = xor_block(oa1, l2);
-                let oa5 = xor_block(oa0, l2);
-                let oa6 = xor_block(offset, l2);
-                let oa7 = xor_block(oa6, *l_ptr2.add(tz));
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(offset, l1);
+            let oa3 = xor_block(oa2, l2);
+            let oa4 = xor_block(oa1, l2);
+            let oa5 = xor_block(oa0, l2);
+            let oa6 = xor_block(offset, l2);
+            let oa7 = unsafe {
+                xor_block(oa6, *l_ptr2.add(tz))
+            };
 
-                storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
-                storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
-                storeu_block_with_offset(ct_ptr, xor_block(ct[2], oa2), 32);
-                storeu_block_with_offset(ct_ptr, xor_block(ct[3], oa3), 48);
-                storeu_block_with_offset(ct_ptr, xor_block(ct[4], oa4), 64);
-                storeu_block_with_offset(ct_ptr, xor_block(ct[5], oa5), 80);
-                storeu_block_with_offset(ct_ptr, xor_block(ct[6], oa6), 96);
-                storeu_block_with_offset(ct_ptr, xor_block(ct[7], oa7), 112);
+            storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
+            storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[2], oa2), 32);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[3], oa3), 48);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[4], oa4), 64);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[5], oa5), 80);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[6], oa6), 96);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[7], oa7), 112);
 
-                offset = oa7;
+            offset = oa7;
+            unsafe {
                 pt_ptr = pt_ptr.add(BPI * 16);
                 ct_ptr = ct_ptr.add(BPI * 16);
             }
@@ -388,7 +406,7 @@ impl AEctx {
     #[allow(clippy::pointers_in_nomem_asm_block)]
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
-    unsafe fn dec_bpi_loop(
+    fn dec_bpi_loop(
         &self,
         mut ct_ptr: *const u8,
         mut pt_ptr: *mut u8,
@@ -402,42 +420,50 @@ impl AEctx {
         for _ in 0..num_bpi {
             block_num += BPI as u32;
             let tz = block_num.trailing_zeros() as usize;
+            let mut l_ptr = self.L.as_ptr();
+            // Same as in enc_bpi_loop; we try to prevent LLVM
+            // to move loop independent variables up the loop.
             unsafe {
-                let mut l_ptr = self.L.as_ptr();
                 core::arch::asm!(
                     "/* {0} */",
                     inout(reg) l_ptr,
                     // This asm does nothing, so tell the compiler.
                     options(pure, nomem, nostack, preserves_flags)
                 );
-                let mut rk_ptr = self.decrypt_key.rd_key.as_ptr();
-                let k0 = _mm_load_si128(rk_ptr);
-                let l0 = _mm_load_si128(l_ptr);
-                let l1 = _mm_load_si128(l_ptr.add(1));
-                let l2 = _mm_load_si128(l_ptr.add(2));
+            }
+            let mut rk_ptr = self.decrypt_key.rd_key.as_ptr();
+            let k0 = load_block(rk_ptr);
+            let l0 = load_block(l_ptr);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
+            };
 
-                let ok = xor_block(offset, k0);
-                let oa0_k = xor_block(ok, l0);
-                let oa1_k = xor_block(oa0_k, l1);
-                let oa2_k = xor_block(ok, l1);
-                let oa3_k = xor_block(oa2_k, l2);
-                let oa4_k = xor_block(oa1_k, l2);
-                let oa5_k = xor_block(oa0_k, l2);
-                let oa6_k = xor_block(ok, l2);
-                // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16`
-                // and in-bounds for `self.L`.
-                let l_tz = *l_ptr.add(tz);
-                let oa7_k = xor_block(oa6_k, l_tz);
+            let ok = xor_block(offset, k0);
+            let oa0_k = xor_block(ok, l0);
+            let oa1_k = xor_block(oa0_k, l1);
+            let oa2_k = xor_block(ok, l1);
+            let oa3_k = xor_block(oa2_k, l2);
+            let oa4_k = xor_block(oa1_k, l2);
+            let oa5_k = xor_block(oa0_k, l2);
+            let oa6_k = xor_block(ok, l2);
+            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16`
+            // and in-bounds for `self.L`.
+            let l_tz = unsafe {
+                *l_ptr.add(tz)
+            };
 
-                let b0 = xor_block(oa0_k, loadu_block(ct_ptr as *const __m128i));
-                let b1 = xor_block(oa1_k, loadu_block_with_offset(ct_ptr, 16));
-                let b2 = xor_block(oa2_k, loadu_block_with_offset(ct_ptr, 32));
-                let b3 = xor_block(oa3_k, loadu_block_with_offset(ct_ptr, 48));
-                let b4 = xor_block(oa4_k, loadu_block_with_offset(ct_ptr, 64));
-                let b5 = xor_block(oa5_k, loadu_block_with_offset(ct_ptr, 80));
-                let b6 = xor_block(oa6_k, loadu_block_with_offset(ct_ptr, 96));
-                let b7 = xor_block(oa7_k, loadu_block_with_offset(ct_ptr, 112));
+            let oa7_k = xor_block(oa6_k, l_tz);
 
+            let b0 = xor_block(oa0_k, loadu_block(ct_ptr as *const __m128i));
+            let b1 = xor_block(oa1_k, loadu_block_with_offset(ct_ptr, 16));
+            let b2 = xor_block(oa2_k, loadu_block_with_offset(ct_ptr, 32));
+            let b3 = xor_block(oa3_k, loadu_block_with_offset(ct_ptr, 48));
+            let b4 = xor_block(oa4_k, loadu_block_with_offset(ct_ptr, 64));
+            let b5 = xor_block(oa5_k, loadu_block_with_offset(ct_ptr, 80));
+            let b6 = xor_block(oa6_k, loadu_block_with_offset(ct_ptr, 96));
+            let b7 = xor_block(oa7_k, loadu_block_with_offset(ct_ptr, 112));
+
+            unsafe {
                 core::arch::asm!(
                     "/* {0} {1} {2} */",
                     inout(xmm_reg) offset,
@@ -445,46 +471,52 @@ impl AEctx {
                     inout(reg) rk_ptr,
                     options(pure, nomem, nostack, preserves_flags)
                 );
+            }
 
-                let d = AesKey::AES_decrypt_8_blocks_prewhitened(
-                    rk_ptr,
-                    [b0, b1, b2, b3, b4, b5, b6, b7],
-                );
+            let d = AesKey::AES_decrypt_8_blocks_prewhitened(
+                rk_ptr,
+                [b0, b1, b2, b3, b4, b5, b6, b7],
+            );
 
-                // Telescoping checksum: d[m] = pt[m] ^ oa[m], so d0 ^ .. ^ d7 == (pt0 ^ .. ^ pt7) ^ offset ^ oa7.
-                let sum0 = xor_block(xor_block(d[0], d[1]), xor_block(d[2], d[3]));
-                let sum1 = xor_block(xor_block(d[4], d[5]), xor_block(d[6], d[7]));
-                checksum = xor_block(checksum, xor_block(sum0, sum1));
+            let sum0 = xor_block(xor_block(d[0], d[1]), xor_block(d[2], d[3]));
+            let sum1 = xor_block(xor_block(d[4], d[5]), xor_block(d[6], d[7]));
+            checksum = xor_block(checksum, xor_block(sum0, sum1));
 
-                let mut l_ptr2 = self.L.as_ptr();
+            let mut l_ptr2 = self.L.as_ptr();
+            unsafe {
                 core::arch::asm!(
                     "/* {0} */",
                     inout(reg) l_ptr2,
                     options(pure, nomem, nostack, preserves_flags)
                 );
-                let l0 = _mm_load_si128(l_ptr2);
-                let l1 = _mm_load_si128(l_ptr2.add(1));
-                let l2 = _mm_load_si128(l_ptr2.add(2));
+            }
+            let l0 = load_block(l_ptr2);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2)))
+            };
 
-                let oa0 = xor_block(offset, l0);
-                let oa1 = xor_block(oa0, l1);
-                let oa2 = xor_block(offset, l1);
-                let oa3 = xor_block(oa2, l2);
-                let oa4 = xor_block(oa1, l2);
-                let oa5 = xor_block(oa0, l2);
-                let oa6 = xor_block(offset, l2);
-                let oa7 = xor_block(oa6, *l_ptr2.add(tz));
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(offset, l1);
+            let oa3 = xor_block(oa2, l2);
+            let oa4 = xor_block(oa1, l2);
+            let oa5 = xor_block(oa0, l2);
+            let oa6 = xor_block(offset, l2);
+            let oa7 = unsafe {
+                xor_block(oa6, *l_ptr2.add(tz))
+            };
 
-                storeu_block(pt_ptr as *mut __m128i, xor_block(d[0], oa0));
-                storeu_block_with_offset(pt_ptr, xor_block(d[1], oa1), 16);
-                storeu_block_with_offset(pt_ptr, xor_block(d[2], oa2), 32);
-                storeu_block_with_offset(pt_ptr, xor_block(d[3], oa3), 48);
-                storeu_block_with_offset(pt_ptr, xor_block(d[4], oa4), 64);
-                storeu_block_with_offset(pt_ptr, xor_block(d[5], oa5), 80);
-                storeu_block_with_offset(pt_ptr, xor_block(d[6], oa6), 96);
-                storeu_block_with_offset(pt_ptr, xor_block(d[7], oa7), 112);
+            storeu_block(pt_ptr as *mut __m128i, xor_block(d[0], oa0));
+            storeu_block_with_offset(pt_ptr, xor_block(d[1], oa1), 16);
+            storeu_block_with_offset(pt_ptr, xor_block(d[2], oa2), 32);
+            storeu_block_with_offset(pt_ptr, xor_block(d[3], oa3), 48);
+            storeu_block_with_offset(pt_ptr, xor_block(d[4], oa4), 64);
+            storeu_block_with_offset(pt_ptr, xor_block(d[5], oa5), 80);
+            storeu_block_with_offset(pt_ptr, xor_block(d[6], oa6), 96);
+            storeu_block_with_offset(pt_ptr, xor_block(d[7], oa7), 112);
 
-                offset = oa7;
+            offset = oa7;
+            unsafe {
                 ct_ptr = ct_ptr.add(128);
                 pt_ptr = pt_ptr.add(128);
             }
@@ -632,7 +664,7 @@ impl AEctx {
         checksum: __m128i,
     ) -> (*mut u8, __m128i, __m128i) {
         let mask = TAIL_STORE_MASK.get(data_len);
-        let pt_padded = unsafe { Self::load_tail_padded(data_ptr, data_len, mask) };
+        let pt_padded = Self::load_tail_padded(data_ptr, data_len, mask);
         let checksum = xor_block(checksum, pt_padded);
         let offset = xor_block(offset, self.lstar);
         let pad = self.encrypt_key.AES_encrypt_block(offset);
@@ -650,7 +682,7 @@ impl AEctx {
 
     /// Compute and store the final tag
     #[inline(always)]
-    unsafe fn compute_and_store_tag(
+    fn compute_and_store_tag(
         &self,
         ct_ptr: *mut u8,
         offset: __m128i,
@@ -660,9 +692,11 @@ impl AEctx {
         let t = xor_block(xor_block(offset, self.ldollar), checksum);
         let mut tag = self.encrypt_key.AES_encrypt_block(t);
         if !ad.is_empty() {
-            tag = xor_block(tag, self.process_ad(ad));
+            unsafe {
+                tag = xor_block(tag, self.process_ad(ad));
+            }
         }
-        _mm_storeu_si128(ct_ptr as *mut __m128i, tag);
+        storeu_block(ct_ptr as *mut __m128i, tag);
     }
 
     #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
@@ -689,9 +723,9 @@ impl AEctx {
         let num_bpi = pt_len / (BPI * 16);
 
         if num_bpi > 0 {
+            (offset, checksum) = self.dec_bpi_loop(ct_ptr, pt_ptr, num_bpi, offset);
+            let bytes = num_bpi * (BPI * 16);
             unsafe {
-                (offset, checksum) = self.dec_bpi_loop(ct_ptr, pt_ptr, num_bpi, offset);
-                let bytes = num_bpi * (BPI * 16);
                 ct_ptr = ct_ptr.add(bytes);
                 pt_ptr = pt_ptr.add(bytes);
             }
@@ -807,7 +841,7 @@ impl AEctx {
         let mut t = xor_block(xor_block(offset, self.ldollar), checksum);
         t = self.encrypt_key.AES_encrypt_block(t);
         if !ad.is_empty() {
-            t = xor_block(t, unsafe { self.process_ad(ad) });
+            t = xor_block(t, self.process_ad(ad));
         }
         if equal_blocks(t, tag) == 0 {
             // Wipe everything we may have written to the destination.

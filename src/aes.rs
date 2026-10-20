@@ -140,11 +140,11 @@ impl AesKey {
         }
     }
 
-    /// Encrypts 8 blocks in lockstep where `b[0..8]` have already been XORed with `rd_key[0]`.
+    /// Encrypts 8 blocks where `b[0..8]` have already been XORed with `rd_key[0]`.
     /// Passing `rk` as a pointer prevents LLVM's LICM from hoisting all 10 round keys into
     /// virtual registers across loop iterations, keeping total live XMM registers <= 16.
     #[inline(always)]
-    pub(crate) unsafe fn AES_encrypt_8_blocks_prewhitened(
+    pub(crate) fn AES_encrypt_8_blocks_prewhitened(
         rk: *const __m128i,
         mut b: [__m128i; 8],
     ) -> [__m128i; 8] {
@@ -225,7 +225,7 @@ impl AesKey {
 
     /// Decrypts 8 blocks in lockstep where `b[0..8]` have already been XORed with `rd_key[0]`.
     #[inline(always)]
-    pub(crate) unsafe fn AES_decrypt_8_blocks_prewhitened(
+    pub(crate) fn AES_decrypt_8_blocks_prewhitened(
         rk: *const __m128i,
         mut b: [__m128i; 8],
     ) -> [__m128i; 8] {

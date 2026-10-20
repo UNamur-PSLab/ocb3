@@ -36,6 +36,13 @@ pub(crate) fn loadu_block(a: *const __m128i) -> __m128i {
     unsafe { _mm_loadu_si128(a) }
 }
 
+/// Aligned load from a raw pointer. The caller must ensure that the 16 bytes at `a` are readable
+/// and aligned to 16-byte boundary.
+#[inline(always)]
+pub(crate) fn load_block(a: *const __m128i) -> __m128i {
+    unsafe { _mm_load_si128(a) }
+}
+
 /// Unaligned load with offset from the base pointer `a`. The caller must uphold the
 /// safety contract for `offset`; i.e., the caller must be certain that a + offset
 /// is a correct address.
@@ -83,11 +90,11 @@ pub(crate) fn swap_if_le(block: __m128i) -> __m128i {
 }
 
 #[inline(always)]
-pub(crate) fn gen_offset(KtopStr: &[u64; 3], bot: i32) -> __m128i {
+pub(crate) fn gen_offset(ktop_str: &[u64; 3], bot: i32) -> __m128i {
     unsafe {
-        let ptr_KtopStr = KtopStr.as_ptr();
-        let hi = _mm_loadu_si128(ptr_KtopStr as *const __m128i);
-        let mut lo = _mm_loadu_si128(KtopStr[1..].as_ptr() as *const __m128i);
+        let ptr_ktop_str = ktop_str.as_ptr();
+        let hi = _mm_loadu_si128(ptr_ktop_str as *const __m128i);
+        let mut lo = _mm_loadu_si128(ktop_str[1..].as_ptr() as *const __m128i);
         let lshift = _mm_cvtsi32_si128(bot);
         let rshift = _mm_cvtsi32_si128(64i32 - bot);
         lo = _mm_xor_si128(_mm_sll_epi64(hi, lshift), _mm_srl_epi64(lo, rshift));
@@ -127,13 +134,13 @@ pub fn m128i_to_bswap_u64x2(val: __m128i) -> [u64; 2] {
 
 #[cold]
 #[inline(never)]
-pub(crate) unsafe fn load_padded_tail_cold(ptr: *const u8, len: usize) -> __m128i {
+pub(crate) fn load_padded_tail_cold(ptr: *const u8, len: usize) -> __m128i {
     let mut tmp = [0u8; 16];
     unsafe {
         core::ptr::copy_nonoverlapping(ptr, tmp.as_mut_ptr(), len);
-        tmp[len] = 0x80;
-        _mm_loadu_si128(tmp.as_ptr() as *const __m128i)
     }
+    tmp[len] = 0x80;
+    loadu_block(tmp.as_ptr() as *const __m128i)
 }
 
 /// Masks used for the SSE handling of the tail encryption.
