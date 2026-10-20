@@ -1,4 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
 use crate::DecryptIO;
 use crate::EncryptIO;
 use crate::OCB_TAG_LEN;
@@ -15,13 +14,9 @@ const PAGE_OFFSET_MASK: usize = PAGE_SIZE_4K - 1;
 
 #[repr(C, align(16))]
 pub struct AEctx {
-    offset: __m128i,
-    checksum: __m128i,
     lstar: __m128i,
     ldollar: __m128i,
     L: [__m128i; L_TABLE_SZ],
-    ad_checksum: __m128i,
-    ad_offset: __m128i,
     cached_top: __m128i,
     decrypt_key: AesKey,
     encrypt_key: AesKey,
@@ -29,17 +24,19 @@ pub struct AEctx {
 }
 
 impl AEctx {
+    #[inline]
     pub fn new(key: &[u8]) -> Self {
+        unsafe { Self::new_inner(key) }
+    }
+
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    unsafe fn new_inner(key: &[u8]) -> Self {
         // Safety: needs to be 16-bytes aligned.
         let zero = zero_block();
         let mut ctx = AEctx {
-            offset: zero,
-            checksum: zero,
             lstar: zero,
             ldollar: zero,
             L: [zero; L_TABLE_SZ],
-            ad_checksum: zero,
-            ad_offset: zero,
             cached_top: zero,
             decrypt_key: AesKey::default(),
             encrypt_key: AesKey::default(),
@@ -66,12 +63,12 @@ impl AEctx {
 
     #[inline(always)]
     fn gen_offset_from_nonce(&mut self, nonce: &[u8; 12]) -> __m128i {
-        let mut tmp = [0u8; 16];
-        tmp[3] = 0x01;
-        tmp[4..16].copy_from_slice(nonce);
-        let idx: i32 = tmp[15] as i32 & 0x3f;
-        tmp[15] &= 0xc0;
-        let mut bl = loadu_block(tmp.as_ptr() as *const __m128i);
+        let n_hi = unsafe { core::ptr::read_unaligned(nonce.as_ptr() as *const u32) };
+        let n_lo = unsafe { core::ptr::read_unaligned(nonce.as_ptr().add(4) as *const u64) };
+        let idx = (nonce[11] & 0x3f) as i32;
+        let lo_qword = 0x0100_0000u64 | ((n_hi as u64) << 32);
+        let hi_qword = n_lo & !(0x3fu64 << 56);
+        let mut bl = unsafe { _mm_set_epi64x(hi_qword as i64, lo_qword as i64) };
         if equal_blocks(bl, self.cached_top) == 0 {
             self.cached_top = bl;
             bl = self.encrypt_key.AES_encrypt_block(bl);
@@ -84,108 +81,136 @@ impl AEctx {
     }
 
     #[inline(always)]
-    fn process_ad(&mut self, ad: &[u8]) {
+    fn load_tail_padded(ptr: *const u8, len: usize, mask: __m128i) -> __m128i {
+        // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
+        // within the same page, overreading partial bytes cannot cross into an unmapped
+        // page and will never cause a page fault. Otherwise we safely copy up to page
+        // boundary.
+        if ((ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
+            let raw = loadu_block(ptr as *const __m128i);
+            unsafe { _mm_or_si128(_mm_and_si128(raw, mask), TAIL_PAD_80.get(len)) }
+        } else {
+            load_padded_tail_cold(ptr, len)
+        }
+    }
+
+    #[allow(clippy::pointers_in_nomem_asm_block)]
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[inline(never)]
+    fn process_ad(&self, ad: &[u8]) -> __m128i {
         let num_bpi = ad.len() / (BPI * 16);
         let mut ad_blocks_num: usize = 0;
-        let l0 = self.L[0];
-        let l1 = self.L[1];
-        let l2 = self.L[2];
         let mut ad_ptr = ad.as_ptr();
-        let mut ad_offset = self.ad_offset;
-        let mut ad_checksum = self.ad_checksum;
+        let mut ad_offset = zero_block();
+        let mut ad_checksum = zero_block();
+
         for _ in 0..num_bpi {
             ad_blocks_num += BPI;
             let tz = ad_blocks_num.trailing_zeros() as usize;
-            let oa0 = xor_block(ad_offset, l0);
-            let oa1 = xor_block(oa0, l1);
-            let oa2 = xor_block(ad_offset, l1);
-            let oa3 = xor_block(oa2, l2);
+            let mut l_ptr = self.L.as_ptr();
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) l_ptr,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
+            let k0 = load_block(rk_ptr);
+            let l0 = load_block(l_ptr);
+            // SAFETY: self.l contains 16 elements; we are accessing the first 3.
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
+            };
 
-            let ad0 = loadu_block(ad_ptr as *const __m128i);
-            let ad1 = loadu_block_with_offset(ad_ptr, 16);
-            let ad2 = loadu_block_with_offset(ad_ptr, 32);
-            let ad3 = loadu_block_with_offset(ad_ptr, 48);
-
-            let ct_lo = self.encrypt_key.AES_encrypt_4_blocks([
-                xor_block(oa0, ad0),
-                xor_block(oa1, ad1),
-                xor_block(oa2, ad2),
-                xor_block(oa3, ad3),
-            ]);
-
-            let sum0 = xor_block(xor_block(ct_lo[0], ct_lo[1]), xor_block(ct_lo[2], ct_lo[3]));
-            ad_checksum = xor_block(ad_checksum, sum0);
-
-            let oa4 = xor_block(oa1, l2);
-            let oa5 = xor_block(oa0, l2);
-            let oa6 = xor_block(ad_offset, l2);
+            let offset_k = xor_block(ad_offset, k0);
+            let oa0_k = xor_block(offset_k, l0);
+            let oa1_k = xor_block(oa0_k, l1);
+            let oa2_k = xor_block(offset_k, l1);
+            let oa3_k = xor_block(oa2_k, l2);
+            let oa4_k = xor_block(oa1_k, l2);
+            let oa5_k = xor_block(oa0_k, l2);
+            let oa6_k = xor_block(offset_k, l2);
             // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.L`.
-            ad_offset = xor_block(oa6, table_get(&self.L, tz));
+            let l_tz = unsafe {
+                *l_ptr.add(tz)
+            };
+            ad_offset = xor_block(xor_block(ad_offset, l2), l_tz);
+            let oa7_k = xor_block(oa6_k, l_tz);
 
-            let ad4 = loadu_block_with_offset(ad_ptr, 64);
-            let ad5 = loadu_block_with_offset(ad_ptr, 80);
-            let ad6 = loadu_block_with_offset(ad_ptr, 96);
-            let ad7 = loadu_block_with_offset(ad_ptr, 112);
+            let b0 = xor_block(oa0_k, loadu_block(ad_ptr as *const __m128i));
+            let b1 = xor_block(oa1_k, loadu_block_with_offset(ad_ptr, 16));
+            let b2 = xor_block(oa2_k, loadu_block_with_offset(ad_ptr, 32));
+            let b3 = xor_block(oa3_k, loadu_block_with_offset(ad_ptr, 48));
+            let b4 = xor_block(oa4_k, loadu_block_with_offset(ad_ptr, 64));
+            let b5 = xor_block(oa5_k, loadu_block_with_offset(ad_ptr, 80));
+            let b6 = xor_block(oa6_k, loadu_block_with_offset(ad_ptr, 96));
+            let b7 = xor_block(oa7_k, loadu_block_with_offset(ad_ptr, 112));
 
-            let ct_hi = self.encrypt_key.AES_encrypt_4_blocks([
-                xor_block(oa4, ad4),
-                xor_block(oa5, ad5),
-                xor_block(oa6, ad6),
-                xor_block(ad_offset, ad7),
-            ]);
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} {1} */",
+                    inout(xmm_reg) ad_offset,
+                    inout(reg) rk_ptr,
+                        options(pure, nomem, nostack, preserves_flags)
+                );
+            }
 
-            let sum1 = xor_block(xor_block(ct_hi[0], ct_hi[1]), xor_block(ct_hi[2], ct_hi[3]));
-            ad_checksum = xor_block(ad_checksum, sum1);
+            let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
+                rk_ptr,
+                [b0, b1, b2, b3, b4, b5, b6, b7],
+            );
+            let sum0 = xor_block(xor_block(ct[0], ct[1]), xor_block(ct[2], ct[3]));
+            let sum1 = xor_block(xor_block(ct[4], ct[5]), xor_block(ct[6], ct[7]));
+            ad_checksum = xor_block(ad_checksum, xor_block(sum0, sum1));
 
-            // SAFETY: in range since we have num_bpi blocks of 128 bytes each.
             unsafe {
                 ad_ptr = ad_ptr.add(128);
             }
         }
 
+        let l0 = self.L[0];
+        let l1 = self.L[1];
+        let l2 = self.L[2];
         let mut remaining = ad.len() % (BPI * 16);
-        let mut k = 0;
         if remaining >= 64 {
-            let bl = xor_block(ad_offset, l0);
+            let oa0 = xor_block(ad_offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(ad_offset, l1);
+            let oa3 = xor_block(oa2, l2);
+            ad_offset = oa3;
+
             let ad0 = loadu_block(ad_ptr as *const __m128i);
-            let ta0 = xor_block(bl, ad0);
-            let ct = self.encrypt_key.AES_encrypt_block(ta0);
-            ad_checksum = xor_block(ad_checksum, ct);
-            let bl = xor_block(bl, l1);
             let ad1 = loadu_block_with_offset(ad_ptr, 16);
-            let ta1 = xor_block(bl, ad1);
-            let ct = self.encrypt_key.AES_encrypt_block(ta1);
-            ad_checksum = xor_block(ad_checksum, ct);
             let ad2 = loadu_block_with_offset(ad_ptr, 32);
-            ad_offset = xor_block(ad_offset, l1);
-            let ta2 = xor_block(ad_offset, ad2);
-            let ct = self.encrypt_key.AES_encrypt_block(ta2);
-            ad_checksum = xor_block(ad_checksum, ct);
-            ad_offset = xor_block(ad_offset, l2);
             let ad3 = loadu_block_with_offset(ad_ptr, 48);
-            let ta3 = xor_block(ad_offset, ad3);
-            let ct = self.encrypt_key.AES_encrypt_block(ta3);
-            ad_checksum = xor_block(ad_checksum, ct);
+
+            let ct = self.encrypt_key.AES_encrypt_4_blocks([
+                xor_block(oa0, ad0),
+                xor_block(oa1, ad1),
+                xor_block(oa2, ad2),
+                xor_block(oa3, ad3),
+            ]);
+            let sum = xor_block(xor_block(ct[0], ct[1]), xor_block(ct[2], ct[3]));
+            ad_checksum = xor_block(ad_checksum, sum);
             remaining -= 64;
-            k += 4;
             // SAFETY: in range since remaining >= 64
             unsafe {
                 ad_ptr = ad_ptr.add(64);
             }
         }
         if remaining >= 32 {
-            ad_offset = xor_block(ad_offset, l0);
+            // Block k+1 (odd: ntz is 0) and block k+2 (even: k is 0 or 4, so k+2 is 2 or 6, ntz is 1)
+            let oa0 = xor_block(ad_offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            ad_offset = oa1;
+
             let ad0 = loadu_block(ad_ptr as *const __m128i);
-            let ta0 = xor_block(ad_offset, ad0);
-            let ct = self.encrypt_key.AES_encrypt_block(ta0);
-            ad_checksum = xor_block(ad_checksum, ct);
-            let tz = (k + 2u8).trailing_zeros() as usize;
-            // SAFETY: `k` is 0 or 4, so `k + 2` is 2 or 6 and `tz` is 1, which is in-bounds for `self.L`.
-            ad_offset = xor_block(ad_offset, table_get(&self.L, tz));
             let ad1 = loadu_block_with_offset(ad_ptr, 16);
-            let ta1 = xor_block(ad_offset, ad1);
-            let ct = self.encrypt_key.AES_encrypt_block(ta1);
-            ad_checksum = xor_block(ad_checksum, ct);
+            let ct = self
+                .encrypt_key
+                .AES_encrypt_2_blocks([xor_block(oa0, ad0), xor_block(oa1, ad1)]);
+            ad_checksum = xor_block(ad_checksum, xor_block(ct[0], ct[1]));
             // SAFETY: in range since remaining >= 32
             unsafe {
                 ad_ptr = ad_ptr.add(32);
@@ -205,45 +230,18 @@ impl AEctx {
             remaining -= 16;
         }
         if remaining > 0 {
-            // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
-            // within the same page, overreading partial bytes cannot cross into an unmapped
-            // page and will never cause a page fault. Otherwise we safely copy up to page
-            // boundary.
-            let ad0 = if ((ad_ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
-                let raw = loadu_block(ad_ptr as *const __m128i);
-                unsafe {
-                    _mm_or_si128(
-                        _mm_shuffle_epi8(raw, TAIL_LOAD_MASK.get(remaining)),
-                        TAIL_PAD_80.get(remaining),
-                    )
-                }
-            } else {
-                let mut tmp = [0u8; 16];
-                // SAFETY: we have at least `remaining` bytes left in ad_ptr, and `tmp` is >
-                // `remaining` and does not overlap.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(ad_ptr, tmp.as_mut_ptr(), remaining);
-                }
-                tmp[remaining] = 0x80;
-                loadu_block(tmp.as_ptr() as *const __m128i)
-            };
+            let mask = TAIL_STORE_MASK.get(remaining);
+            let ad0 = unsafe { Self::load_tail_padded(ad_ptr, remaining, mask) };
             ad_offset = xor_block(ad_offset, self.lstar);
             let ta = xor_block(ad_offset, ad0);
             let ct = self.encrypt_key.AES_encrypt_block(ta);
             ad_checksum = xor_block(ad_checksum, ct);
         }
-        self.ad_offset = ad_offset;
-        self.ad_checksum = ad_checksum;
+        ad_checksum
     }
 
     #[inline(always)]
-    fn enc_block(
-        &mut self,
-        oa: __m128i,
-        pt_ptr: *const u8,
-        ct_ptr: *mut u8,
-        checksum: &mut __m128i,
-    ) {
+    fn enc_block(&self, oa: __m128i, pt_ptr: *const u8, ct_ptr: *mut u8, checksum: &mut __m128i) {
         let pt = loadu_block(pt_ptr as *const __m128i);
         let t = xor_block(oa, pt);
         let ct = self.encrypt_key.AES_encrypt_block(t);
@@ -252,36 +250,8 @@ impl AEctx {
     }
 
     #[inline(always)]
-    fn dec_block(
-        &mut self,
-        oa: __m128i,
-        ct_ptr: *const u8,
-        pt_ptr: *mut u8,
-        checksum: &mut __m128i,
-    ) {
-        let ct = loadu_block(ct_ptr as *const __m128i);
-        let t = xor_block(oa, ct);
-        let pt = self.decrypt_key.AES_decrypt_block(t);
-        let pt = xor_block(pt, oa);
-        storeu_block(pt_ptr as *mut __m128i, pt);
-        *checksum = xor_block(*checksum, pt)
-    }
-
-    #[inline(always)]
-    fn enc_single_block(&mut self, pt_ptr: *const u8, ct_ptr: *mut u8, block_num: &mut u32) {
-        *block_num += 1;
-        let tz = block_num.trailing_zeros() as usize;
-        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
-        let oa = xor_block(self.offset, table_get(&self.L, tz));
-        let mut checksum = self.checksum;
-        self.enc_block(oa, pt_ptr, ct_ptr, &mut checksum);
-        self.checksum = checksum;
-        self.offset = oa;
-    }
-
-    #[inline(always)]
     fn enc_single_block_local(
-        &mut self,
+        &self,
         pt_ptr: *const u8,
         ct_ptr: *mut u8,
         block_num: &mut u32,
@@ -296,134 +266,377 @@ impl AEctx {
         oa
     }
 
-    #[inline(always)]
-    fn dec_single_block_local(
-        &mut self,
-        ct_ptr: *const u8,
-        pt_ptr: *mut u8,
-        block_num: &mut u32,
-        offset: __m128i,
-        checksum: &mut __m128i,
-    ) -> __m128i {
-        *block_num += 1;
-        let tz = block_num.trailing_zeros() as usize;
-        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds
-        // for `self.L`.
-        let oa = xor_block(offset, table_get(&self.L, tz));
-        self.dec_block(oa, ct_ptr, pt_ptr, checksum);
-        oa
-    }
-
-    #[inline(always)]
-    fn enc_bpi(
-        &mut self,
-        pt_ptr: *const u8,
-        ct_ptr: *mut u8,
-        block_num: u32,
-        offset: __m128i,
-        checksum: &mut __m128i,
-    ) -> (__m128i, u32) {
-        debug_assert_eq!(block_num % 8, 0);
-        let block_num = block_num + BPI as u32;
-        let l0 = self.L[0];
-        let l1 = self.L[1];
-        let l2 = self.L[2];
-
-        let oa0 = xor_block(offset, l0);
-        let oa1 = xor_block(oa0, l1);
-        let oa2 = xor_block(oa1, l0);
-        let oa3 = xor_block(oa2, l2);
-
-        let pt0 = loadu_block(pt_ptr as *const __m128i);
-        let pt1 = loadu_block_with_offset(pt_ptr, 16);
-        let pt2 = loadu_block_with_offset(pt_ptr, 32);
-        let pt3 = loadu_block_with_offset(pt_ptr, 48);
-
-        let pt_sum0 = xor_block(xor_block(pt0, pt1), xor_block(pt2, pt3));
-        *checksum = xor_block(*checksum, pt_sum0);
-
-        // Encrypting 4 blocks at once seems to avoid to spill a xmm register on the stack.
-        // For 8 blocks, we needed 18 registers (16 for oa[0..7] and ta[0..7] (now directly xored)
-        // and 2 for the offset and checksum, but we only had 16.
-        //
-        // Encrypting 4 blocks at once seems to still allow to fully occupy the processor's
-        // pipelines.
-        let ct_lo = self.encrypt_key.AES_encrypt_4_blocks([
-            xor_block(oa0, pt0),
-            xor_block(oa1, pt1),
-            xor_block(oa2, pt2),
-            xor_block(oa3, pt3),
-        ]);
-
-        storeu_block(ct_ptr as *mut __m128i, xor_block(ct_lo[0], oa0));
-        storeu_block_with_offset(ct_ptr, xor_block(ct_lo[1], oa1), 16);
-        storeu_block_with_offset(ct_ptr, xor_block(ct_lo[2], oa2), 32);
-        storeu_block_with_offset(ct_ptr, xor_block(ct_lo[3], oa3), 48);
-
-        let oa4 = xor_block(oa1, l2);
-        let oa5 = xor_block(oa0, l2);
-        let oa6 = xor_block(offset, l2);
-        let tz = block_num.trailing_zeros() as usize;
-        // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `ntz < 16` and in-bounds for `self.L`.
-        let oa7 = xor_block(oa6, table_get(&self.L, tz));
-
-        let pt4 = loadu_block_with_offset(pt_ptr, 64);
-        let pt5 = loadu_block_with_offset(pt_ptr, 80);
-        let pt6 = loadu_block_with_offset(pt_ptr, 96);
-        let pt7 = loadu_block_with_offset(pt_ptr, 112);
-
-        let pt_sum1 = xor_block(xor_block(pt4, pt5), xor_block(pt6, pt7));
-        *checksum = xor_block(*checksum, pt_sum1);
-
-        let ct_hi = self.encrypt_key.AES_encrypt_4_blocks([
-            xor_block(oa4, pt4),
-            xor_block(oa5, pt5),
-            xor_block(oa6, pt6),
-            xor_block(oa7, pt7),
-        ]);
-
-        storeu_block_with_offset(ct_ptr, xor_block(ct_hi[0], oa4), 64);
-        storeu_block_with_offset(ct_ptr, xor_block(ct_hi[1], oa5), 80);
-        storeu_block_with_offset(ct_ptr, xor_block(ct_hi[2], oa6), 96);
-        storeu_block_with_offset(ct_ptr, xor_block(ct_hi[3], oa7), 112);
-
-        (oa7, block_num)
-    }
-
-    #[inline(always)]
-    fn enc_contiguous(
-        &mut self,
+    /// Encrypts `num_bpi` groups of 8 blocks (`128` bytes each) starting at an 8-block aligned
+    /// `block_num`. Uses all 16 XMM registers with zero stack spills via prewhitened offsets
+    /// and a telescoping offset-whitened checksum.
+    #[allow(clippy::pointers_in_nomem_asm_block)]
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[inline(never)]
+    unsafe fn enc_bpi_loop(
+        &self,
         mut pt_ptr: *const u8,
         mut ct_ptr: *mut u8,
-        mut full_blocks: usize,
-        block_num: &mut u32,
-    ) -> (*const u8, *mut u8) {
-        let mut offset = self.offset;
-        let mut checksum = self.checksum;
+        num_bpi: usize,
+        mut block_num: u32,
+        mut offset: __m128i,
+        mut checksum: __m128i,
+    ) -> (__m128i, __m128i) {
+        debug_assert_eq!(block_num % 8, 0);
+        let init_offset = offset;
 
-        while !(*block_num).is_multiple_of(BPI as u32) && full_blocks > 0 {
-            offset = self.enc_single_block_local(pt_ptr, ct_ptr, block_num, offset, &mut checksum);
-            //SAFETY: full_blocks indicate how many 16-bytes blocks we may advance until
-            //we end up to a multople of BPI.
-            unsafe {
-                pt_ptr = pt_ptr.add(16);
-                ct_ptr = ct_ptr.add(16);
-            }
-            full_blocks -= 1;
-        }
-
-        let num_bpi = full_blocks / BPI;
         for _ in 0..num_bpi {
-            (offset, *block_num) = self.enc_bpi(pt_ptr, ct_ptr, *block_num, offset, &mut checksum);
+            block_num += BPI as u32;
+            let tz = block_num.trailing_zeros() as usize;
+            let mut l_ptr = self.L.as_ptr();
+            unsafe {
+                // l0, l1, l2 are loop invariant but must not be declared outside of the loop
+                // or the compiler considers them living through the whole loop as it should be,
+                // but that creates register pressure. Instead, we load them before we encrypt,
+                // and reload them again when needed after the encryption. This way, we never
+                // spill registers on the stack.
+                //
+                // The asm below is no-op, but prevents the compiler to put l0, l1, l2 outside of
+                // the loop. This is however brittle as it depends for the *current* compiler
+                // heuristics ...
+                // TODO Emit the whole loop as asm?
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) l_ptr,
+                    // This asm does nothing, so tell the compiler.
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
+            let k0 = load_block(rk_ptr);
+            let l0 = load_block(l_ptr);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
+            };
+
+            let ok = xor_block(offset, k0);
+            let oa0_k = xor_block(ok, l0);
+            let oa1_k = xor_block(oa0_k, l1);
+            let oa2_k = xor_block(ok, l1);
+            let oa3_k = xor_block(oa2_k, l2);
+            let oa4_k = xor_block(oa1_k, l2);
+            let oa5_k = xor_block(oa0_k, l2);
+            let oa6_k = xor_block(ok, l2);
+            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds for `self.L`.
+            let l_tz = unsafe {
+                *l_ptr.add(tz)
+            };
+            let oa7_k = xor_block(oa6_k, l_tz);
+
+            let b0 = xor_block(oa0_k, loadu_block(pt_ptr as *const __m128i));
+            let b1 = xor_block(oa1_k, loadu_block_with_offset(pt_ptr, 16));
+            let b2 = xor_block(oa2_k, loadu_block_with_offset(pt_ptr, 32));
+            let b3 = xor_block(oa3_k, loadu_block_with_offset(pt_ptr, 48));
+            let b4 = xor_block(oa4_k, loadu_block_with_offset(pt_ptr, 64));
+            let b5 = xor_block(oa5_k, loadu_block_with_offset(pt_ptr, 80));
+            let b6 = xor_block(oa6_k, loadu_block_with_offset(pt_ptr, 96));
+            let b7 = xor_block(oa7_k, loadu_block_with_offset(pt_ptr, 112));
+
+            // Telescoping checksum: b0 ^ .. ^ b7 == (pt0 ^ .. ^ pt7) ^ offset ^ oa7.
+            let sum0 = xor_block(xor_block(b0, b1), xor_block(b2, b3));
+            let sum1 = xor_block(xor_block(b4, b5), xor_block(b6, b7));
+            checksum = xor_block(checksum, xor_block(sum0, sum1));
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} {1} */",
+                    inout(xmm_reg) checksum,
+                    inout(reg) rk_ptr,
+                    // This asm does nothing, so tell the compiler.
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+
+            let ct = AesKey::AES_encrypt_8_blocks_prewhitened(
+                rk_ptr,
+                [b0, b1, b2, b3, b4, b5, b6, b7],
+            );
+
+            // Reloading l0, l1, l2 again, reusing registers, and heuristically
+            // preventing LLVM to move these variables outside of the loop.
+            let mut l_ptr2 = self.L.as_ptr();
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) l_ptr2,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            let l0 = load_block(l_ptr2);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2)))
+            };
+
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(offset, l1);
+            let oa3 = xor_block(oa2, l2);
+            let oa4 = xor_block(oa1, l2);
+            let oa5 = xor_block(oa0, l2);
+            let oa6 = xor_block(offset, l2);
+            let oa7 = unsafe {
+                xor_block(oa6, *l_ptr2.add(tz))
+            };
+
+            storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
+            storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[2], oa2), 32);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[3], oa3), 48);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[4], oa4), 64);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[5], oa5), 80);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[6], oa6), 96);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[7], oa7), 112);
+
+            offset = oa7;
             unsafe {
                 pt_ptr = pt_ptr.add(BPI * 16);
                 ct_ptr = ct_ptr.add(BPI * 16);
             }
         }
-        full_blocks %= BPI;
 
-        while full_blocks > 0 {
-            offset = self.enc_single_block_local(pt_ptr, ct_ptr, block_num, offset, &mut checksum);
+        checksum = xor_block(checksum, xor_block(init_offset, offset));
+        (offset, checksum)
+    }
+
+    /// Decrypts `num_bpi` groups of 8 blocks (`128` bytes each) in lockstep using all 16 XMM
+    /// registers and both AES pipelines.
+    #[allow(clippy::pointers_in_nomem_asm_block)]
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[inline(never)]
+    fn dec_bpi_loop(
+        &self,
+        mut ct_ptr: *const u8,
+        mut pt_ptr: *mut u8,
+        num_bpi: usize,
+        mut offset: __m128i,
+    ) -> (__m128i, __m128i) {
+        let mut block_num = 0u32;
+        let init_offset = offset;
+        let mut checksum = zero_block();
+
+        for _ in 0..num_bpi {
+            block_num += BPI as u32;
+            let tz = block_num.trailing_zeros() as usize;
+            let mut l_ptr = self.L.as_ptr();
+            // Same as in enc_bpi_loop; we try to prevent LLVM
+            // to move loop independent variables up the loop.
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) l_ptr,
+                    // This asm does nothing, so tell the compiler.
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            let mut rk_ptr = self.decrypt_key.rd_key.as_ptr();
+            let k0 = load_block(rk_ptr);
+            let l0 = load_block(l_ptr);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
+            };
+
+            let ok = xor_block(offset, k0);
+            let oa0_k = xor_block(ok, l0);
+            let oa1_k = xor_block(oa0_k, l1);
+            let oa2_k = xor_block(ok, l1);
+            let oa3_k = xor_block(oa2_k, l2);
+            let oa4_k = xor_block(oa1_k, l2);
+            let oa5_k = xor_block(oa0_k, l2);
+            let oa6_k = xor_block(ok, l2);
+            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16`
+            // and in-bounds for `self.L`.
+            let l_tz = unsafe {
+                *l_ptr.add(tz)
+            };
+
+            let oa7_k = xor_block(oa6_k, l_tz);
+
+            let b0 = xor_block(oa0_k, loadu_block(ct_ptr as *const __m128i));
+            let b1 = xor_block(oa1_k, loadu_block_with_offset(ct_ptr, 16));
+            let b2 = xor_block(oa2_k, loadu_block_with_offset(ct_ptr, 32));
+            let b3 = xor_block(oa3_k, loadu_block_with_offset(ct_ptr, 48));
+            let b4 = xor_block(oa4_k, loadu_block_with_offset(ct_ptr, 64));
+            let b5 = xor_block(oa5_k, loadu_block_with_offset(ct_ptr, 80));
+            let b6 = xor_block(oa6_k, loadu_block_with_offset(ct_ptr, 96));
+            let b7 = xor_block(oa7_k, loadu_block_with_offset(ct_ptr, 112));
+
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} {1} {2} */",
+                    inout(xmm_reg) offset,
+                    inout(xmm_reg) checksum,
+                    inout(reg) rk_ptr,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+
+            let d = AesKey::AES_decrypt_8_blocks_prewhitened(
+                rk_ptr,
+                [b0, b1, b2, b3, b4, b5, b6, b7],
+            );
+
+            let sum0 = xor_block(xor_block(d[0], d[1]), xor_block(d[2], d[3]));
+            let sum1 = xor_block(xor_block(d[4], d[5]), xor_block(d[6], d[7]));
+            checksum = xor_block(checksum, xor_block(sum0, sum1));
+
+            let mut l_ptr2 = self.L.as_ptr();
+            unsafe {
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) l_ptr2,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            let l0 = load_block(l_ptr2);
+            let (l1, l2) = unsafe {
+                (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2)))
+            };
+
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(offset, l1);
+            let oa3 = xor_block(oa2, l2);
+            let oa4 = xor_block(oa1, l2);
+            let oa5 = xor_block(oa0, l2);
+            let oa6 = xor_block(offset, l2);
+            let oa7 = unsafe {
+                xor_block(oa6, *l_ptr2.add(tz))
+            };
+
+            storeu_block(pt_ptr as *mut __m128i, xor_block(d[0], oa0));
+            storeu_block_with_offset(pt_ptr, xor_block(d[1], oa1), 16);
+            storeu_block_with_offset(pt_ptr, xor_block(d[2], oa2), 32);
+            storeu_block_with_offset(pt_ptr, xor_block(d[3], oa3), 48);
+            storeu_block_with_offset(pt_ptr, xor_block(d[4], oa4), 64);
+            storeu_block_with_offset(pt_ptr, xor_block(d[5], oa5), 80);
+            storeu_block_with_offset(pt_ptr, xor_block(d[6], oa6), 96);
+            storeu_block_with_offset(pt_ptr, xor_block(d[7], oa7), 112);
+
+            offset = oa7;
+            unsafe {
+                ct_ptr = ct_ptr.add(128);
+                pt_ptr = pt_ptr.add(128);
+            }
+        }
+
+        checksum = xor_block(checksum, xor_block(init_offset, offset));
+        (offset, checksum)
+    }
+
+    /// Encrypts `full_blocks` starting from an 8-block aligned `block_num`, using the 8-block
+    /// lockstep loop followed by `4 -> 2 -> 1` parallel leftover blocks with constant offsets.
+    #[inline(always)]
+    fn enc_aligned_blocks(
+        &self,
+        mut pt_ptr: *const u8,
+        mut ct_ptr: *mut u8,
+        full_blocks: usize,
+        block_num: &mut u32,
+        mut offset: __m128i,
+        checksum: &mut __m128i,
+    ) -> (*const u8, *mut u8, __m128i) {
+        let num_bpi = full_blocks / BPI;
+        if num_bpi > 0 {
+            unsafe {
+                (offset, *checksum) =
+                    self.enc_bpi_loop(pt_ptr, ct_ptr, num_bpi, *block_num, offset, *checksum);
+                let bytes = num_bpi * (BPI * 16);
+                pt_ptr = pt_ptr.add(bytes);
+                ct_ptr = ct_ptr.add(bytes);
+            }
+            *block_num += (num_bpi * BPI) as u32;
+        }
+        let mut rem_blocks = full_blocks % BPI;
+        *block_num += rem_blocks as u32;
+
+        let l0 = self.L[0];
+        let l1 = self.L[1];
+        let l2 = self.L[2];
+
+        if rem_blocks >= 4 {
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            let oa2 = xor_block(offset, l1);
+            let oa3 = xor_block(oa2, l2);
+            offset = oa3;
+
+            let pt0 = loadu_block(pt_ptr as *const __m128i);
+            let pt1 = loadu_block_with_offset(pt_ptr, 16);
+            let pt2 = loadu_block_with_offset(pt_ptr, 32);
+            let pt3 = loadu_block_with_offset(pt_ptr, 48);
+
+            let pt_sum = xor_block(xor_block(pt0, pt1), xor_block(pt2, pt3));
+            *checksum = xor_block(*checksum, pt_sum);
+
+            let ct = self.encrypt_key.AES_encrypt_4_blocks([
+                xor_block(oa0, pt0),
+                xor_block(oa1, pt1),
+                xor_block(oa2, pt2),
+                xor_block(oa3, pt3),
+            ]);
+
+            storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
+            storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[2], oa2), 32);
+            storeu_block_with_offset(ct_ptr, xor_block(ct[3], oa3), 48);
+
+            unsafe {
+                pt_ptr = pt_ptr.add(64);
+                ct_ptr = ct_ptr.add(64);
+            }
+            rem_blocks -= 4;
+        }
+        if rem_blocks >= 2 {
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            offset = oa1;
+
+            let pt0 = loadu_block(pt_ptr as *const __m128i);
+            let pt1 = loadu_block_with_offset(pt_ptr, 16);
+            *checksum = xor_block(*checksum, xor_block(pt0, pt1));
+
+            let ct = self
+                .encrypt_key
+                .AES_encrypt_2_blocks([xor_block(oa0, pt0), xor_block(oa1, pt1)]);
+
+            storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
+            storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
+
+            unsafe {
+                pt_ptr = pt_ptr.add(32);
+                ct_ptr = ct_ptr.add(32);
+            }
+            rem_blocks -= 2;
+        }
+        if rem_blocks >= 1 {
+            offset = xor_block(offset, l0);
+            self.enc_block(offset, pt_ptr, ct_ptr, checksum);
+            unsafe {
+                pt_ptr = pt_ptr.add(16);
+                ct_ptr = ct_ptr.add(16);
+            }
+        }
+
+        (pt_ptr, ct_ptr, offset)
+    }
+
+    #[inline(always)]
+    fn enc_unaligned_contiguous(
+        &self,
+        mut pt_ptr: *const u8,
+        mut ct_ptr: *mut u8,
+        mut full_blocks: usize,
+        block_num: &mut u32,
+        mut offset: __m128i,
+        checksum: &mut __m128i,
+    ) -> (*const u8, *mut u8, __m128i) {
+        while !(*block_num).is_multiple_of(BPI as u32) && full_blocks > 0 {
+            offset = self.enc_single_block_local(pt_ptr, ct_ptr, block_num, offset, checksum);
+            //SAFETY: full_blocks indicate how many 16-bytes blocks we may advance until
+            //we end up to a multiple of BPI.
             unsafe {
                 pt_ptr = pt_ptr.add(16);
                 ct_ptr = ct_ptr.add(16);
@@ -431,72 +644,69 @@ impl AEctx {
             full_blocks -= 1;
         }
 
-        self.offset = offset;
-        self.checksum = checksum;
+        if full_blocks > 0 {
+            (pt_ptr, ct_ptr, offset) =
+                self.enc_aligned_blocks(pt_ptr, ct_ptr, full_blocks, block_num, offset, checksum);
+        }
 
-        (pt_ptr, ct_ptr)
+        (pt_ptr, ct_ptr, offset)
     }
 
     /// Encrypts the final partial block (`len < 16`) with `0x80` padding and L*.
-    /// Returns the `ct_ptr` advanced past the written ciphertext.
+    /// Returns the updated `(ct_ptr, offset, checksum)`.
     #[inline(always)]
-    fn enc_tail(&mut self, data_ptr: *const u8, data_len: usize, ct_ptr: *mut u8) -> *mut u8 {
-        // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
-        // within the same page, overreading partial bytes cannot cross into an unmapped
-        // page and will never cause a page fault. Otherwise we safely copy up to page
-        // boundary.
-        let pt_padded = if ((data_ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
-            let raw = loadu_block(data_ptr as *const __m128i);
-            unsafe {
-                _mm_or_si128(
-                    _mm_shuffle_epi8(raw, TAIL_LOAD_MASK.get(data_len)),
-                    TAIL_PAD_80.get(data_len),
-                )
-            }
-        } else {
-            let mut tmp = [0u8; 16];
-            unsafe {
-                core::ptr::copy_nonoverlapping(data_ptr, tmp.as_mut_ptr(), data_len);
-            }
-            tmp[data_len] = 0x80;
-            loadu_block(tmp.as_ptr() as *const __m128i)
-        };
-        self.checksum = xor_block(self.checksum, pt_padded);
-        let t = xor_block(self.offset, self.lstar);
-        let pad = self.encrypt_key.AES_encrypt_block(t);
+    fn enc_tail(
+        &self,
+        data_ptr: *const u8,
+        data_len: usize,
+        ct_ptr: *mut u8,
+        offset: __m128i,
+        checksum: __m128i,
+    ) -> (*mut u8, __m128i, __m128i) {
+        let mask = TAIL_STORE_MASK.get(data_len);
+        let pt_padded = Self::load_tail_padded(data_ptr, data_len, mask);
+        let checksum = xor_block(checksum, pt_padded);
+        let offset = xor_block(offset, self.lstar);
+        let pad = self.encrypt_key.AES_encrypt_block(offset);
         let ct_block = xor_block(pt_padded, pad);
 
         //SAFETY: the ciphertext slice is required to be 16 bytes longer than the plaintext, so
         //this cannot fall outside of the allocation. In case of InPlace encryption, this design
         //encrypts up to the size of the input buffer - 16, so this is safe to do.
         let old = loadu_block(ct_ptr as *const __m128i);
-        let blended = blendv_block(old, ct_block, TAIL_STORE_MASK.get(data_len));
+        let blended = blendv_block(old, ct_block, mask);
         storeu_block(ct_ptr as *mut __m128i, blended);
 
-        self.offset = t;
-        unsafe { ct_ptr.add(data_len) }
+        (unsafe { ct_ptr.add(data_len) }, offset, checksum)
     }
 
     /// Compute and store the final tag
     #[inline(always)]
-    unsafe fn compute_and_store_tag(&mut self, ct_ptr: *mut u8) {
-        self.offset = xor_block(self.offset, self.ldollar);
-        let ta = xor_block(self.offset, self.checksum);
-        let ct = self.encrypt_key.AES_encrypt_block(ta);
-        self.offset = xor_block(ct, self.ad_checksum);
-        _mm_storeu_si128(ct_ptr as *mut __m128i, self.offset);
+    fn compute_and_store_tag(
+        &self,
+        ct_ptr: *mut u8,
+        offset: __m128i,
+        checksum: __m128i,
+        ad: &[u8],
+    ) {
+        let t = xor_block(xor_block(offset, self.ldollar), checksum);
+        let mut tag = self.encrypt_key.AES_encrypt_block(t);
+        if !ad.is_empty() {
+            unsafe {
+                tag = xor_block(tag, self.process_ad(ad));
+            }
+        }
+        storeu_block(ct_ptr as *mut __m128i, tag);
     }
 
-    #[target_feature(enable = "aes,ssse3,sse4.1")]
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     pub fn ae_decrypt(&mut self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
-        self.offset = self.gen_offset_from_nonce(nonce);
-        self.ad_offset = _mm_setzero_si128();
-        self.checksum = _mm_setzero_si128();
-        self.ad_checksum = _mm_setzero_si128();
-        if !ad.is_empty() {
-            self.process_ad(ad);
+        if ad.len() > crate::MAX_PT_SIZE {
+            return Err(crate::CryptoError::PlaintextTooLong);
         }
+        let mut offset = self.gen_offset_from_nonce(nonce);
+        let mut checksum = _mm_setzero_si128();
         let io_len = io.len();
 
         let (mut ct_ptr, mut pt_ptr, fail_zero_len) = match io {
@@ -511,131 +721,115 @@ impl AEctx {
 
         let pt_len = io_len - OCB_TAG_LEN as usize;
         let num_bpi = pt_len / (BPI * 16);
-        let mut remaining = pt_len % (BPI * 16);
 
+        if num_bpi > 0 {
+            (offset, checksum) = self.dec_bpi_loop(ct_ptr, pt_ptr, num_bpi, offset);
+            let bytes = num_bpi * (BPI * 16);
+            unsafe {
+                ct_ptr = ct_ptr.add(bytes);
+                pt_ptr = pt_ptr.add(bytes);
+            }
+        }
+
+        // Leftover full blocks (0..7) after the 8-block groups.
         let l0 = self.L[0];
         let l1 = self.L[1];
         let l2 = self.L[2];
-        let mut block_num = 0;
-        let mut offset = self.offset;
-        let mut checksum = self.checksum;
+        let mut full_blocks = (pt_len % (BPI * 16)) / 16;
 
-        // 8 blocks at once fully using all xmm registers, and the 2 parallel AES pipelines.
-        for _ in 0..num_bpi {
-            block_num += BPI as u32;
+        if full_blocks >= 4 {
             let oa0 = xor_block(offset, l0);
             let oa1 = xor_block(oa0, l1);
-            let oa2 = xor_block(oa1, l0);
+            let oa2 = xor_block(offset, l1);
             let oa3 = xor_block(oa2, l2);
+            offset = oa3;
 
             let ct0 = loadu_block(ct_ptr as *const __m128i);
             let ct1 = loadu_block_with_offset(ct_ptr, 16);
             let ct2 = loadu_block_with_offset(ct_ptr, 32);
             let ct3 = loadu_block_with_offset(ct_ptr, 48);
 
-            let pt_lo = self.decrypt_key.AES_decrypt_4_blocks([
+            let d = self.decrypt_key.AES_decrypt_4_blocks([
                 xor_block(oa0, ct0),
                 xor_block(oa1, ct1),
                 xor_block(oa2, ct2),
                 xor_block(oa3, ct3),
             ]);
 
-            let p0 = xor_block(pt_lo[0], oa0);
-            let p1 = xor_block(pt_lo[1], oa1);
-            let p2 = xor_block(pt_lo[2], oa2);
-            let p3 = xor_block(pt_lo[3], oa3);
+            let p0 = xor_block(d[0], oa0);
+            let p1 = xor_block(d[1], oa1);
+            let p2 = xor_block(d[2], oa2);
+            let p3 = xor_block(d[3], oa3);
 
             let ptsum = xor_block(xor_block(p0, p1), xor_block(p2, p3));
-            checksum = xor_block(ptsum, checksum);
+            checksum = xor_block(checksum, ptsum);
 
             storeu_block(pt_ptr as *mut __m128i, p0);
             storeu_block_with_offset(pt_ptr, p1, 16);
             storeu_block_with_offset(pt_ptr, p2, 32);
             storeu_block_with_offset(pt_ptr, p3, 48);
 
-            let oa4 = xor_block(oa1, l2);
-            let oa5 = xor_block(oa0, l2);
-            let oa6 = xor_block(offset, l2);
-            let tz = block_num.trailing_zeros() as usize;
-            // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16`
-            // and in-bounds for `self.L`.
-            let oa7 = xor_block(oa6, table_get(&self.L, tz));
-            offset = oa7;
+            unsafe {
+                ct_ptr = ct_ptr.add(64);
+                pt_ptr = pt_ptr.add(64);
+            }
+            full_blocks -= 4;
+        }
+        if full_blocks >= 2 {
+            let oa0 = xor_block(offset, l0);
+            let oa1 = xor_block(oa0, l1);
+            offset = oa1;
 
-            let ct4 = loadu_block_with_offset(ct_ptr, 64);
-            let ct5 = loadu_block_with_offset(ct_ptr, 80);
-            let ct6 = loadu_block_with_offset(ct_ptr, 96);
-            let ct7 = loadu_block_with_offset(ct_ptr, 112);
+            let ct0 = loadu_block(ct_ptr as *const __m128i);
+            let ct1 = loadu_block_with_offset(ct_ptr, 16);
 
-            let pt_hi = self.decrypt_key.AES_decrypt_4_blocks([
-                xor_block(oa4, ct4),
-                xor_block(oa5, ct5),
-                xor_block(oa6, ct6),
-                xor_block(oa7, ct7),
-            ]);
+            let d = self
+                .decrypt_key
+                .AES_decrypt_2_blocks([xor_block(oa0, ct0), xor_block(oa1, ct1)]);
 
-            let pt4 = xor_block(pt_hi[0], oa4);
-            let pt5 = xor_block(pt_hi[1], oa5);
-            let pt6 = xor_block(pt_hi[2], oa6);
-            let pt7 = xor_block(pt_hi[3], oa7);
+            let p0 = xor_block(d[0], oa0);
+            let p1 = xor_block(d[1], oa1);
+            checksum = xor_block(checksum, xor_block(p0, p1));
 
-            let ptsum = xor_block(xor_block(pt4, pt5), xor_block(pt6, pt7));
-            checksum = xor_block(ptsum, checksum);
-
-            storeu_block_with_offset(pt_ptr, pt4, 64);
-            storeu_block_with_offset(pt_ptr, pt5, 80);
-            storeu_block_with_offset(pt_ptr, pt6, 96);
-            storeu_block_with_offset(pt_ptr, pt7, 112);
+            storeu_block(pt_ptr as *mut __m128i, p0);
+            storeu_block_with_offset(pt_ptr, p1, 16);
 
             unsafe {
-                ct_ptr = ct_ptr.add(128);
-                pt_ptr = pt_ptr.add(128);
+                ct_ptr = ct_ptr.add(32);
+                pt_ptr = pt_ptr.add(32);
             }
+            full_blocks -= 2;
         }
-
-        // Leftover full blocks after the 8-block groups.
-        let mut full_blocks = remaining / 16;
-        while full_blocks > 0 {
-            offset =
-                self.dec_single_block_local(ct_ptr, pt_ptr, &mut block_num, offset, &mut checksum);
+        if full_blocks >= 1 {
+            offset = xor_block(offset, l0);
+            let ct = loadu_block(ct_ptr as *const __m128i);
+            let d = self.decrypt_key.AES_decrypt_block(xor_block(offset, ct));
+            let pt = xor_block(d, offset);
+            storeu_block(pt_ptr as *mut __m128i, pt);
+            checksum = xor_block(checksum, pt);
             unsafe {
                 ct_ptr = ct_ptr.add(16);
                 pt_ptr = pt_ptr.add(16);
             }
-            full_blocks -= 1;
-            remaining -= 16;
         }
 
+        let remaining = pt_len & 15;
         if remaining > 0 {
-            let ct0 = if ((ct_ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
-                let raw = loadu_block(ct_ptr as *const __m128i);
-                _mm_or_si128(
-                    _mm_shuffle_epi8(raw, TAIL_LOAD_MASK.get(remaining)),
-                    TAIL_PAD_80.get(remaining),
-                )
-            } else {
-                let mut tmp = [0u8; 16];
-                // SAFETY: we have at least `remaining` bytes left in ct_ptr, and `tmp` is
-                // larger than `remaining` and does not overlap.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(ct_ptr, tmp.as_mut_ptr(), remaining);
-                }
-                tmp[remaining] = 0x80;
-                loadu_block(tmp.as_ptr() as *const __m128i)
-            };
+            // SAFETY: `in_ct` always contains `remaining` ciphertext bytes followed by 16 tag
+            // bytes (`remaining + 16 >= 17` readable bytes), so a 16-byte load at `ct_ptr` is
+            // always in-bounds of the input slice.
+            let raw = loadu_block(ct_ptr as *const __m128i);
             offset = xor_block(offset, self.lstar);
             let pad = self.encrypt_key.AES_encrypt_block(offset);
-            let pt = xor_block(ct0, pad);
-            // Only the first `remaining` bytes of `pt` are plaintext; the padding must
-            // stay `0x80 || 0^*` in the checksum.
             let mask = TAIL_STORE_MASK.get(remaining);
-            let pt = blendv_block(ct0, pt, mask);
-            checksum = xor_block(checksum, pt);
+            let pt_zero_padded = _mm_and_si128(xor_block(raw, pad), mask);
+            let pt_padded = _mm_or_si128(pt_zero_padded, TAIL_PAD_80.get(remaining));
+            checksum = xor_block(checksum, pt_padded);
             let old = loadu_block(pt_ptr as *const __m128i);
             // SAFETY: blends the plaintext with the tag in the case of in-place decryption. In
             // the out-of-place case, the destination buffer is at least pt_len + OCB_TAG_LEN
             // bytes (see DecryptIO::validate).
-            let blended = blendv_block(old, pt, mask);
+            let blended = blendv_block(old, pt_zero_padded, mask);
             storeu_block(pt_ptr as *mut __m128i, blended);
             unsafe {
                 ct_ptr = ct_ptr.add(remaining);
@@ -646,7 +840,9 @@ impl AEctx {
         let tag = loadu_block(ct_ptr as *const __m128i);
         let mut t = xor_block(xor_block(offset, self.ldollar), checksum);
         t = self.encrypt_key.AES_encrypt_block(t);
-        t = xor_block(t, self.ad_checksum);
+        if !ad.is_empty() {
+            t = xor_block(t, self.process_ad(ad));
+        }
         if equal_blocks(t, tag) == 0 {
             // Wipe everything we may have written to the destination.
             // SAFETY: out_start is the start of the destination buffer and fail_zero_len
@@ -660,122 +856,142 @@ impl AEctx {
         Ok(())
     }
 
-    #[target_feature(enable = "aes,ssse3,sse4.1")]
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
-        self.offset = self.gen_offset_from_nonce(nonce);
-        self.ad_offset = _mm_setzero_si128();
-        self.ad_checksum = _mm_setzero_si128();
-        self.checksum = _mm_setzero_si128();
-        if !ad.is_empty() {
-            self.process_ad(ad);
+        if ad.len() > crate::MAX_PT_SIZE {
+            return Err(crate::CryptoError::PlaintextTooLong);
         }
+        let mut offset = self.gen_offset_from_nonce(nonce);
+        let mut checksum = _mm_setzero_si128();
 
         unsafe {
             let mut block_num = 0u32;
 
-            match io {
+            let (mut pt_ptr, mut ct_ptr, pt_len) = match io {
                 EncryptIO::InPlace(buf) => {
                     // The buffer holds the plaintext followed by a 16-byte tag slot.
-                    let pt_len = buf.len() - OCB_TAG_LEN as usize;
-                    let mut pt_ptr = buf.as_ptr();
-                    let mut ct_ptr = buf.as_mut_ptr();
-                    let full_blocks = pt_len / 16;
-                    let rem = pt_len % 16;
-
-                    (pt_ptr, ct_ptr) =
-                        self.enc_contiguous(pt_ptr, ct_ptr, full_blocks, &mut block_num);
-                    if rem > 0 {
-                        ct_ptr = self.enc_tail(pt_ptr, rem, ct_ptr);
-                    }
-                    self.compute_and_store_tag(ct_ptr);
+                    (
+                        buf.as_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len() - OCB_TAG_LEN as usize,
+                    )
                 }
-                EncryptIO::OutOfPlace { in_pt, out } => match in_pt {
-                    PlainText::Contiguous(pt) => {
-                        let mut pt_ptr = pt.as_ptr();
-                        let mut ct_ptr = out.as_mut_ptr();
-                        let full_blocks = pt.len() / 16;
-                        let rem = pt.len() % 16;
+                EncryptIO::OutOfPlace {
+                    in_pt: PlainText::Contiguous(pt),
+                    out,
+                } => (pt.as_ptr(), out.as_mut_ptr(), pt.len()),
+                EncryptIO::OutOfPlace {
+                    in_pt: PlainText::Scattered(pt1, pt2),
+                    out,
+                } => {
+                    let mut pt1_ptr = pt1.as_ptr();
+                    let mut pt2_ptr = pt2.as_ptr();
+                    let mut ct_ptr = out.as_mut_ptr();
 
-                        (pt_ptr, ct_ptr) =
-                            self.enc_contiguous(pt_ptr, ct_ptr, full_blocks, &mut block_num);
-                        if rem > 0 {
-                            ct_ptr = self.enc_tail(pt_ptr, rem, ct_ptr);
-                        }
-                        self.compute_and_store_tag(ct_ptr);
-                    }
-                    PlainText::Scattered(pt1, pt2) => {
-                        let mut pt1_ptr = pt1.as_ptr();
-                        let mut pt2_ptr = pt2.as_ptr();
-                        let mut ct_ptr = out.as_mut_ptr();
+                    let full_blocks_pt1 = pt1.len() / 16;
+                    let rem_pt1 = pt1.len() & 15;
 
-                        let full_blocks_pt1 = pt1.len() / 16;
-                        let rem_pt1 = pt1.len() % 16;
+                    (pt1_ptr, ct_ptr, offset) = self.enc_aligned_blocks(
+                        pt1_ptr,
+                        ct_ptr,
+                        full_blocks_pt1,
+                        &mut block_num,
+                        offset,
+                        &mut checksum,
+                    );
 
-                        (pt1_ptr, ct_ptr) =
-                            self.enc_contiguous(pt1_ptr, ct_ptr, full_blocks_pt1, &mut block_num);
-
-                        if rem_pt1 > 0 {
-                            if pt2.is_empty() {
-                                ct_ptr = self.enc_tail(pt1_ptr, rem_pt1, ct_ptr);
-                            } else if rem_pt1 + pt2.len() < 16 {
-                                let total_tail = rem_pt1 + pt2.len();
-                                let mut tmp = [0u8; 16];
-                                core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
-                                core::ptr::copy_nonoverlapping(
-                                    pt2_ptr,
-                                    tmp.as_mut_ptr().add(rem_pt1),
-                                    pt2.len(),
-                                );
-                                ct_ptr = self.enc_tail(tmp.as_ptr(), total_tail, ct_ptr);
-                            } else {
-                                // Reassemble one full block from pt1 tail + pt2 head
-                                let need = 16 - rem_pt1;
-                                let mut tmp = [0u8; 16];
-                                core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
-                                core::ptr::copy_nonoverlapping(
-                                    pt2_ptr,
-                                    tmp.as_mut_ptr().add(rem_pt1),
-                                    need,
-                                );
-
-                                self.enc_single_block(tmp.as_ptr(), ct_ptr, &mut block_num);
-                                ct_ptr = ct_ptr.add(16);
-                                pt2_ptr = pt2_ptr.add(need);
-
-                                let remaining_pt2 = pt2.len() - need;
-                                let full_blocks_pt2 = remaining_pt2 / 16;
-                                let rem_pt2 = remaining_pt2 % 16;
-
-                                (pt2_ptr, ct_ptr) = self.enc_contiguous(
-                                    pt2_ptr,
-                                    ct_ptr,
-                                    full_blocks_pt2,
-                                    &mut block_num,
-                                );
-                                if rem_pt2 > 0 {
-                                    ct_ptr = self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
-                                }
-                            }
+                    if rem_pt1 > 0 {
+                        if pt2.is_empty() {
+                            (ct_ptr, offset, checksum) =
+                                self.enc_tail(pt1_ptr, rem_pt1, ct_ptr, offset, checksum);
+                        } else if rem_pt1 + pt2.len() < 16 {
+                            let total_tail = rem_pt1 + pt2.len();
+                            let mut tmp = [0u8; 16];
+                            core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
+                            core::ptr::copy_nonoverlapping(
+                                pt2_ptr,
+                                tmp.as_mut_ptr().add(rem_pt1),
+                                pt2.len(),
+                            );
+                            (ct_ptr, offset, checksum) =
+                                self.enc_tail(tmp.as_ptr(), total_tail, ct_ptr, offset, checksum);
                         } else {
-                            // rem_pt1 == 0, pt2 continues directly
-                            let full_blocks_pt2 = pt2.len() / 16;
-                            let rem_pt2 = pt2.len() % 16;
+                            // Reassemble one full block from pt1 tail + pt2 head
+                            let need = 16 - rem_pt1;
+                            let mut tmp = [0u8; 16];
+                            core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
+                            core::ptr::copy_nonoverlapping(
+                                pt2_ptr,
+                                tmp.as_mut_ptr().add(rem_pt1),
+                                need,
+                            );
 
-                            (pt2_ptr, ct_ptr) = self.enc_contiguous(
+                            offset = self.enc_single_block_local(
+                                tmp.as_ptr(),
+                                ct_ptr,
+                                &mut block_num,
+                                offset,
+                                &mut checksum,
+                            );
+                            ct_ptr = ct_ptr.add(16);
+                            pt2_ptr = pt2_ptr.add(need);
+
+                            let remaining_pt2 = pt2.len() - need;
+                            let full_blocks_pt2 = remaining_pt2 / 16;
+                            let rem_pt2 = remaining_pt2 & 15;
+
+                            (pt2_ptr, ct_ptr, offset) = self.enc_unaligned_contiguous(
                                 pt2_ptr,
                                 ct_ptr,
                                 full_blocks_pt2,
                                 &mut block_num,
+                                offset,
+                                &mut checksum,
                             );
                             if rem_pt2 > 0 {
-                                ct_ptr = self.enc_tail(pt2_ptr, rem_pt2, ct_ptr);
+                                (ct_ptr, offset, checksum) =
+                                    self.enc_tail(pt2_ptr, rem_pt2, ct_ptr, offset, checksum);
                             }
                         }
-                        self.compute_and_store_tag(ct_ptr);
+                    } else {
+                        // rem_pt1 == 0, pt2 continues directly
+                        let full_blocks_pt2 = pt2.len() / 16;
+                        let rem_pt2 = pt2.len() & 15;
+
+                        (pt2_ptr, ct_ptr, offset) = self.enc_unaligned_contiguous(
+                            pt2_ptr,
+                            ct_ptr,
+                            full_blocks_pt2,
+                            &mut block_num,
+                            offset,
+                            &mut checksum,
+                        );
+                        if rem_pt2 > 0 {
+                            (ct_ptr, offset, checksum) =
+                                self.enc_tail(pt2_ptr, rem_pt2, ct_ptr, offset, checksum);
+                        }
                     }
-                },
+                    self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
+                    return Ok(());
+                }
+            };
+
+            let full_blocks = pt_len / 16;
+            let rem = pt_len & 15;
+
+            (pt_ptr, ct_ptr, offset) = self.enc_aligned_blocks(
+                pt_ptr,
+                ct_ptr,
+                full_blocks,
+                &mut block_num,
+                offset,
+                &mut checksum,
+            );
+            if rem > 0 {
+                (ct_ptr, offset, checksum) = self.enc_tail(pt_ptr, rem, ct_ptr, offset, checksum);
             }
+            self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
         }
         Ok(())
     }
@@ -789,7 +1005,7 @@ mod tests {
     // These tests were generated using Qwen-3.8-27B on local hardware, feeding the LLM
     // with the output test vectors of the original C implementation, and asking it to exercice
     // our InPlace/OutOfPLace and Scattered API on the test vectors.
-    
+
     include!("test_vectors/spec_vectors.rs");
     /// Spec test data: pt[i] = ad[i] = i.
     fn spec_data(len: usize) -> Vec<u8> {

@@ -38,18 +38,22 @@ impl<'a> EncryptIO<'a> {
     /// The destination must be larger or equal size than the plaintext buffer.
     #[inline]
     pub fn validate(&self) -> Result<()> {
-        if self.len() > MAX_PT_SIZE {
-            return Err(CryptoError::PlaintextTooLong);
-        }
         match self {
             Self::InPlace(in_pt) => {
                 if in_pt.len() < OCB_TAG_LEN as usize {
                     return Err(CryptoError::DestinationSizeUnfit);
                 }
+                if in_pt.len() - OCB_TAG_LEN as usize > MAX_PT_SIZE {
+                    return Err(CryptoError::PlaintextTooLong);
+                }
                 Ok(())
             }
             Self::OutOfPlace { in_pt, out } => {
-                if in_pt.len() + OCB_TAG_LEN as usize > out.len() {
+                let pt_len = in_pt.len();
+                if pt_len > MAX_PT_SIZE {
+                    return Err(CryptoError::PlaintextTooLong);
+                }
+                if pt_len + OCB_TAG_LEN as usize > out.len() {
                     return Err(CryptoError::DestinationSizeUnfit);
                 }
                 Ok(())
@@ -60,7 +64,7 @@ impl<'a> EncryptIO<'a> {
     #[inline]
     pub fn len(&self) -> usize {
         match self {
-            Self::InPlace(buf) => buf.len(),
+            Self::InPlace(buf) => buf.len().saturating_sub(OCB_TAG_LEN as usize),
             Self::OutOfPlace { in_pt, .. } => in_pt.len(),
         }
     }
@@ -75,11 +79,15 @@ pub enum DecryptIO<'a> {
 }
 
 impl<'a> DecryptIO<'a> {
+    #[inline]
     fn validate(&self) -> Result<()> {
         match self {
             Self::OutOfPlace { in_ct, out_pt } => {
                 if in_ct.len() < OCB_TAG_LEN as usize {
                     return Err(CryptoError::CiphertextTooSmall);
+                }
+                if in_ct.len() - OCB_TAG_LEN as usize > MAX_PT_SIZE {
+                    return Err(CryptoError::PlaintextTooLong);
                 }
 
                 if (out_pt.len() + OCB_TAG_LEN as usize) < in_ct.len() {
@@ -89,6 +97,9 @@ impl<'a> DecryptIO<'a> {
             Self::InPlace(in_ct) => {
                 if in_ct.len() < OCB_TAG_LEN as usize {
                     return Err(CryptoError::CiphertextTooSmall);
+                }
+                if in_ct.len() - OCB_TAG_LEN as usize > MAX_PT_SIZE {
+                    return Err(CryptoError::PlaintextTooLong);
                 }
             }
         }
@@ -123,10 +134,7 @@ pub enum CryptoError {
 
 mod aes;
 pub mod ocb;
+pub use ocb::AEctx;
+
 #[cfg(target_arch = "x86_64")]
 mod sse;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
