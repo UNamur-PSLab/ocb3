@@ -5,6 +5,11 @@ using AVX intrinsics.
 Beyond the Rust rewrite, the libraries exposes an API design tailored
 for encrypted transport protocols such as QUIC, Tor or any protocol
 mixing application data and protocol level controls during encryption.
+In particular, the encryption efficiently supports a scattered input
+buffer capturing common usage of one buffer for application data, and
+one buffer for protocol-level controls. The decryption is atomic and
+does not let the application play with partial yet not authenticated
+plaintexts.
 
 ## Encryption
 
