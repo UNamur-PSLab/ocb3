@@ -3,7 +3,8 @@ use core::arch::x86_64::*;
 
 // from https://github.com/rust-lang-nursery/stdsimd/pull/479 not yet merged
 // due to a wrongtype bug in stdlib https://github.com/rust-lang/stdarch/issues/522
-// we're defining a macro to replace _MM_SHUFFLE
+// we're defining a macro to replace _MM_SHUFFLE. This code should eventually go away
+// when stdlib is fixed.
 macro_rules! _MM_SHUFFLE_FIXME {
     ($z:expr, $y:expr, $x:expr, $w:expr) => {
         ($z << 6) | ($y << 4) | ($x << 2) | $w
