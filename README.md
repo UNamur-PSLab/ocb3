@@ -17,7 +17,7 @@ The library has the current following constraints:
 We can encrypt using the API either **in place**, or **out of place**
 from a contiguous buffer, or **out of place** from a scattered buffer.
 
-**In place.** The buffer holds the plaintext followed by a 16-byte tag slot;
+**In place.** The buffer holds the plaintext followed by a 16-byte tag;
 on return it holds the ciphertext followed by the tag:
 
 ```rust
@@ -100,7 +100,7 @@ The input is `ciphertext || tag`, encrypted with the same key, nonce and
 associated data. `ae_decrypt` verifies the tag with a constant-time
 comparison: on a mismatch it returns `Err(CryptoError::TagInvalid)` and wipes
 everything it may have written to the destination, so no partial plaintext
-survives a failed call.
+survives a failed call. We can decrypt either in place or out of place:
 
 **In place.** The buffer `ciphertext || tag` becomes `plaintext || tag`; the
 tag is left in place:
