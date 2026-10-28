@@ -174,5 +174,5 @@ local AI model to improve the robustness of the implementation, finding
 bugs, writing the tests, discussing optimizations such as LLVM code
 hoisting in loops, and how to prevent it. While primarily written by a
 human, it remains unclear to what extend this library would have been
-different if AI was not used. We thanks all Jon Does from which the model
-learnt and thanks to whom it turned out to be helpful.
+different if AI was not used. We thanks all Jon and Jane Does from which
+the model learnt and thanks to whom it turned out to be helpful.
