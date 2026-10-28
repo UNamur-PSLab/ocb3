@@ -1,3 +1,12 @@
+//! OCB3 encryption/decryption (x86-64 SIMD implementation).
+//!
+//! # Compile-time feature detection
+//!
+//! This module is only compiled on x86_64 targets built with the `avx`,
+//! `aes`, `ssse3` and `sse4.1` target features. The check happens at compile
+//! time in `lib.rs` (`#[cfg(target_feature = ...)]`): on any other target the
+//! crate fails to build with an explanatory message instead of emitting code
+//! that would trap at run time.
 use crate::DecryptIO;
 use crate::EncryptIO;
 use crate::OCB_TAG_LEN;
@@ -12,6 +21,8 @@ const BPI: usize = 8;
 const PAGE_SIZE_4K: usize = 4096;
 const PAGE_OFFSET_MASK: usize = PAGE_SIZE_4K - 1;
 
+/// OCB3 context: the AES-128 key schedule (encrypt and decrypt round keys)
+/// plus the key-derived `L*`, `L$` and `L` table used to build the offsets.
 #[repr(C, align(16))]
 pub struct AEctx {
     lstar: __m128i,
@@ -24,6 +35,7 @@ pub struct AEctx {
 }
 
 impl AEctx {
+    /// Creates an OCB3 context from a 16-byte AES-128 key.
     #[inline]
     pub fn new(key: &[u8]) -> Self {
         unsafe { Self::new_inner(key) }
@@ -95,7 +107,6 @@ impl AEctx {
     }
 
     #[allow(clippy::pointers_in_nomem_asm_block)]
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
     fn process_ad(&self, ad: &[u8]) -> __m128i {
         let num_bpi = ad.len() / (BPI * 16);
@@ -120,9 +131,7 @@ impl AEctx {
             let k0 = load_block(rk_ptr);
             let l0 = load_block(l_ptr);
             // SAFETY: self.l contains 16 elements; we are accessing the first 3.
-            let (l1, l2) = unsafe {
-                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
-            };
+            let (l1, l2) = unsafe { (load_block(l_ptr.add(1)), load_block(l_ptr.add(2))) };
 
             let offset_k = xor_block(ad_offset, k0);
             let oa0_k = xor_block(offset_k, l0);
@@ -133,9 +142,7 @@ impl AEctx {
             let oa5_k = xor_block(oa0_k, l2);
             let oa6_k = xor_block(offset_k, l2);
             // SAFETY: `ad_blocks_num < 2^16` in OCB3, ensuring `tz < 16` and in-bounds for `self.l`.
-            let l_tz = unsafe {
-                *l_ptr.add(tz)
-            };
+            let l_tz = unsafe { *l_ptr.add(tz) };
             ad_offset = xor_block(xor_block(ad_offset, l2), l_tz);
             let oa7_k = xor_block(oa6_k, l_tz);
 
@@ -157,10 +164,8 @@ impl AEctx {
                 );
             }
 
-            let ct = AesKey::aes_encrypt_8_blocks_prewhitened(
-                rk_ptr,
-                [b0, b1, b2, b3, b4, b5, b6, b7],
-            );
+            let ct =
+                AesKey::aes_encrypt_8_blocks_prewhitened(rk_ptr, [b0, b1, b2, b3, b4, b5, b6, b7]);
             let sum0 = xor_block(xor_block(ct[0], ct[1]), xor_block(ct[2], ct[3]));
             let sum1 = xor_block(xor_block(ct[4], ct[5]), xor_block(ct[6], ct[7]));
             ad_checksum = xor_block(ad_checksum, xor_block(sum0, sum1));
@@ -310,9 +315,7 @@ impl AEctx {
             let mut rk_ptr = self.encrypt_key.rd_key.as_ptr();
             let k0 = load_block(rk_ptr);
             let l0 = load_block(l_ptr);
-            let (l1, l2) = unsafe {
-                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
-            };
+            let (l1, l2) = unsafe { (load_block(l_ptr.add(1)), load_block(l_ptr.add(2))) };
 
             let ok = xor_block(offset, k0);
             let oa0_k = xor_block(ok, l0);
@@ -323,9 +326,7 @@ impl AEctx {
             let oa5_k = xor_block(oa0_k, l2);
             let oa6_k = xor_block(ok, l2);
             // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16` and in-bounds for `self.l`.
-            let l_tz = unsafe {
-                *l_ptr.add(tz)
-            };
+            let l_tz = unsafe { *l_ptr.add(tz) };
             let oa7_k = xor_block(oa6_k, l_tz);
 
             let b0 = xor_block(oa0_k, loadu_block(pt_ptr as *const __m128i));
@@ -351,10 +352,8 @@ impl AEctx {
                 );
             }
 
-            let ct = AesKey::aes_encrypt_8_blocks_prewhitened(
-                rk_ptr,
-                [b0, b1, b2, b3, b4, b5, b6, b7],
-            );
+            let ct =
+                AesKey::aes_encrypt_8_blocks_prewhitened(rk_ptr, [b0, b1, b2, b3, b4, b5, b6, b7]);
 
             // Reloading l0, l1, l2 again, reusing registers, and heuristically
             // preventing LLVM to move these variables outside of the loop.
@@ -367,9 +366,7 @@ impl AEctx {
                 );
             }
             let l0 = load_block(l_ptr2);
-            let (l1, l2) = unsafe {
-                (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2)))
-            };
+            let (l1, l2) = unsafe { (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2))) };
 
             let oa0 = xor_block(offset, l0);
             let oa1 = xor_block(oa0, l1);
@@ -378,9 +375,7 @@ impl AEctx {
             let oa4 = xor_block(oa1, l2);
             let oa5 = xor_block(oa0, l2);
             let oa6 = xor_block(offset, l2);
-            let oa7 = unsafe {
-                xor_block(oa6, *l_ptr2.add(tz))
-            };
+            let oa7 = unsafe { xor_block(oa6, *l_ptr2.add(tz)) };
 
             storeu_block(ct_ptr as *mut __m128i, xor_block(ct[0], oa0));
             storeu_block_with_offset(ct_ptr, xor_block(ct[1], oa1), 16);
@@ -405,7 +400,6 @@ impl AEctx {
     /// Decrypts `num_bpi` groups of 8 blocks (`128` bytes each) using all 16 XMM
     /// registers
     #[allow(clippy::pointers_in_nomem_asm_block)]
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     #[inline(never)]
     fn dec_bpi_loop(
         &self,
@@ -435,9 +429,7 @@ impl AEctx {
             let mut rk_ptr = self.decrypt_key.rd_key.as_ptr();
             let k0 = load_block(rk_ptr);
             let l0 = load_block(l_ptr);
-            let (l1, l2) = unsafe {
-                (load_block(l_ptr.add(1)), load_block(l_ptr.add(2)))
-            };
+            let (l1, l2) = unsafe { (load_block(l_ptr.add(1)), load_block(l_ptr.add(2))) };
 
             let ok = xor_block(offset, k0);
             let oa0_k = xor_block(ok, l0);
@@ -449,9 +441,7 @@ impl AEctx {
             let oa6_k = xor_block(ok, l2);
             // SAFETY: `block_num <= MAX_PT_SIZE / 16 < 2^16`, ensuring `tz < 16`
             // and in-bounds for `self.l`.
-            let l_tz = unsafe {
-                *l_ptr.add(tz)
-            };
+            let l_tz = unsafe { *l_ptr.add(tz) };
 
             let oa7_k = xor_block(oa6_k, l_tz);
 
@@ -474,10 +464,8 @@ impl AEctx {
                 );
             }
 
-            let d = AesKey::aes_decrypt_8_blocks_prewhitened(
-                rk_ptr,
-                [b0, b1, b2, b3, b4, b5, b6, b7],
-            );
+            let d =
+                AesKey::aes_decrypt_8_blocks_prewhitened(rk_ptr, [b0, b1, b2, b3, b4, b5, b6, b7]);
 
             let sum0 = xor_block(xor_block(d[0], d[1]), xor_block(d[2], d[3]));
             let sum1 = xor_block(xor_block(d[4], d[5]), xor_block(d[6], d[7]));
@@ -492,9 +480,7 @@ impl AEctx {
                 );
             }
             let l0 = load_block(l_ptr2);
-            let (l1, l2) = unsafe {
-                (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2)))
-            };
+            let (l1, l2) = unsafe { (load_block(l_ptr2.add(1)), load_block(l_ptr2.add(2))) };
 
             let oa0 = xor_block(offset, l0);
             let oa1 = xor_block(oa0, l1);
@@ -503,9 +489,7 @@ impl AEctx {
             let oa4 = xor_block(oa1, l2);
             let oa5 = xor_block(oa0, l2);
             let oa6 = xor_block(offset, l2);
-            let oa7 = unsafe {
-                xor_block(oa6, *l_ptr2.add(tz))
-            };
+            let oa7 = unsafe { xor_block(oa6, *l_ptr2.add(tz)) };
 
             storeu_block(pt_ptr as *mut __m128i, xor_block(d[0], oa0));
             storeu_block_with_offset(pt_ptr, xor_block(d[1], oa1), 16);
@@ -693,15 +677,35 @@ impl AEctx {
         let t = xor_block(xor_block(offset, self.ldollar), checksum);
         let mut tag = self.encrypt_key.aes_encrypt_block(t);
         if !ad.is_empty() {
-            unsafe {
-                tag = xor_block(tag, self.process_ad(ad));
-            }
+            tag = xor_block(tag, self.process_ad(ad));
         }
         storeu_block(ct_ptr as *mut __m128i, tag);
     }
 
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    /// Decrypts and verifies `io` using `nonce` and associated data `ad`. On a
+    /// tag mismatch everything that may have been written to the destination
+    /// is wiped and `Err(CryptoError::TagInvalid)` is returned.
     pub fn ae_decrypt(&mut self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+        // SAFETY: this crate is only compiled for x86_64 targets with the
+        // `avx`, `aes`, `ssse3` and `sse4.1` target features enabled (see the
+        // module-level note), so the feature requirement of `ae_decrypt_inner`
+        // is met. The pointer invariants it relies on are established by
+        // `io.validate()`, which is its first operation.
+        unsafe { self.ae_decrypt_inner(io, nonce, ad) }
+    }
+
+    /// # Safety
+    ///
+    /// Requires the `avx`, `aes`, `ssse3` and `sse4.1` target features to be
+    /// enabled at compile time for the calling context; this crate guarantees that in `lib.rs`'s
+    /// module declaration.
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    unsafe fn ae_decrypt_inner(
+        &mut self,
+        io: DecryptIO,
+        nonce: &[u8; 12],
+        ad: &[u8],
+    ) -> Result<()> {
         io.validate()?;
         if ad.len() > crate::MAX_PT_SIZE {
             return Err(crate::CryptoError::PlaintextTooLong);
@@ -856,7 +860,7 @@ impl AEctx {
 
         Ok(())
     }
-    
+
     /// Encrypt `io` using `nonce` and associated data `ad`. This function is atomic, and depending
     /// on `io`, it does in place encryption and then appends a tag, or out of place encryption and
     /// then appends a tag.
@@ -864,8 +868,27 @@ impl AEctx {
     /// Note that `io` may contain a scattered plaintext of two &[u8] for the out of place
     /// encryption. This is designed for encrypted transports encrypting protocol-level control
     /// information and application-level data.
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+        // SAFETY: this crate is only compiled for x86_64 targets with the
+        // `avx`, `aes`, `ssse3` and `sse4.1` target features enabled (see the
+        // module-level note), so the feature requirement of `ae_encrypt_inner`
+        // is met. The pointer invariants it relies on are established by
+        // `io.validate()`, which is its first operation.
+        unsafe { self.ae_encrypt_inner(io, nonce, ad) }
+    }
+
+    /// # Safety
+    ///
+    /// Requires the `avx`, `aes`, `ssse3` and `sse4.1` target features to be
+    /// enabled at compile time for the calling context; this crate guarrantees that in `lib.rs`'s
+    /// module declaration.
+    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    unsafe fn ae_encrypt_inner(
+        &mut self,
+        io: EncryptIO,
+        nonce: &[u8; 12],
+        ad: &[u8],
+    ) -> Result<()> {
         io.validate()?;
         if ad.len() > crate::MAX_PT_SIZE {
             return Err(crate::CryptoError::PlaintextTooLong);
@@ -1028,17 +1051,15 @@ mod tests {
         ad: &[u8],
     ) -> (Vec<u8>, [u8; 16]) {
         let mut out = vec![0u8; pt.len() + 16];
-        unsafe {
-            ctx.ae_encrypt(
-                EncryptIO::OutOfPlace {
-                    in_pt: PlainText::Contiguous(pt),
-                    out: &mut out,
-                },
-                nonce,
-                ad,
-            )
-            .expect("encrypt failed");
-        }
+        ctx.ae_encrypt(
+            EncryptIO::OutOfPlace {
+                in_pt: PlainText::Contiguous(pt),
+                out: &mut out,
+            },
+            nonce,
+            ad,
+        )
+        .expect("encrypt failed");
         let (ct, tag) = out.split_at(pt.len());
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
@@ -1052,10 +1073,8 @@ mod tests {
     ) -> (Vec<u8>, [u8; 16]) {
         let mut buf = pt.to_vec();
         buf.extend([0u8; 16]);
-        unsafe {
-            ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), nonce, ad)
-                .expect("encrypt failed");
-        }
+        ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), nonce, ad)
+            .expect("encrypt failed");
         let (ct, tag) = buf.split_at(pt.len());
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
@@ -1069,17 +1088,15 @@ mod tests {
         ad: &[u8],
     ) -> (Vec<u8>, [u8; 16]) {
         let mut out = vec![0u8; pt.len() + 16];
-        unsafe {
-            ctx.ae_encrypt(
-                EncryptIO::OutOfPlace {
-                    in_pt: PlainText::Scattered(&pt[..split], &pt[split..]),
-                    out: &mut out,
-                },
-                nonce,
-                ad,
-            )
-            .expect("encrypt failed");
-        }
+        ctx.ae_encrypt(
+            EncryptIO::OutOfPlace {
+                in_pt: PlainText::Scattered(&pt[..split], &pt[split..]),
+                out: &mut out,
+            },
+            nonce,
+            ad,
+        )
+        .expect("encrypt failed");
         let (ct, tag) = out.split_at(pt.len());
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
@@ -1194,16 +1211,14 @@ mod tests {
             // Out of place.
             let mut ctx = AEctx::new(&SPEC_KEY);
             let mut out = vec![0xffu8; ptl + 16];
-            unsafe {
-                ctx.ae_decrypt(
-                    DecryptIO::OutOfPlace {
-                        in_ct: ct_tag,
-                        out_pt: &mut out,
-                    },
-                    &SPEC_NONCE,
-                    &ad,
-                )
-            }
+            ctx.ae_decrypt(
+                DecryptIO::OutOfPlace {
+                    in_ct: ct_tag,
+                    out_pt: &mut out,
+                },
+                &SPEC_NONCE,
+                &ad,
+            )
             .unwrap_or_else(|e| panic!("out-of-place decrypt failed ptl={} adl={}: {e}", ptl, adl));
             assert_eq!(
                 &out[..ptl],
@@ -1216,7 +1231,7 @@ mod tests {
             // In place: the plaintext must come back and the tag must survive.
             let mut ctx = AEctx::new(&SPEC_KEY);
             let mut buf = ct_tag.to_vec();
-            unsafe { ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad) }
+            ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
                 .unwrap_or_else(|e| panic!("in-place decrypt failed ptl={} adl={}: {e}", ptl, adl));
             assert_eq!(
                 &buf[..ptl],
@@ -1239,7 +1254,7 @@ mod tests {
             bad[ptl] ^= 0x01;
             assert!(
                 matches!(
-                    unsafe { ctx.ae_decrypt(DecryptIO::InPlace(&mut bad), &SPEC_NONCE, &ad) },
+                    ctx.ae_decrypt(DecryptIO::InPlace(&mut bad), &SPEC_NONCE, &ad),
                     Err(crate::CryptoError::TagInvalid)
                 ),
                 "corrupted tag accepted for ptl={} adl={}",
@@ -1254,7 +1269,7 @@ mod tests {
                 bad[ptl / 2] ^= 0x01;
                 assert!(
                     matches!(
-                        unsafe { ctx.ae_decrypt(DecryptIO::InPlace(&mut bad), &SPEC_NONCE, &ad) },
+                        ctx.ae_decrypt(DecryptIO::InPlace(&mut bad), &SPEC_NONCE, &ad),
                         Err(crate::CryptoError::TagInvalid)
                     ),
                     "corrupted ct accepted for ptl={} adl={}",
@@ -1270,13 +1285,11 @@ mod tests {
                 bad_ad[adl / 2] ^= 0x01;
                 assert!(
                     matches!(
-                        unsafe {
-                            ctx.ae_decrypt(
-                                DecryptIO::InPlace(&mut ct_tag.to_vec()),
-                                &SPEC_NONCE,
-                                &bad_ad,
-                            )
-                        },
+                        ctx.ae_decrypt(
+                            DecryptIO::InPlace(&mut ct_tag.to_vec()),
+                            &SPEC_NONCE,
+                            &bad_ad,
+                        ),
                         Err(crate::CryptoError::TagInvalid)
                     ),
                     "corrupted ad accepted for ptl={} adl={}",
@@ -1305,7 +1318,7 @@ mod tests {
 
                 // In place.
                 let mut buf = blob.clone();
-                unsafe { ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad) }
+                ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
                     .unwrap_or_else(|e| {
                         panic!("in-place roundtrip failed ptl={} adl={}: {e}", ptl, adl)
                     });
@@ -1326,16 +1339,14 @@ mod tests {
 
                 // Out of place.
                 let mut out = vec![0u8; ptl + 16];
-                unsafe {
-                    ctx.ae_decrypt(
-                        DecryptIO::OutOfPlace {
-                            in_ct: &blob,
-                            out_pt: &mut out,
-                        },
-                        &SPEC_NONCE,
-                        &ad,
-                    )
-                }
+                ctx.ae_decrypt(
+                    DecryptIO::OutOfPlace {
+                        in_ct: &blob,
+                        out_pt: &mut out,
+                    },
+                    &SPEC_NONCE,
+                    &ad,
+                )
                 .unwrap_or_else(|e| panic!("o-o-p roundtrip failed ptl={} adl={}: {e}", ptl, adl));
                 assert_eq!(&out[..ptl], &pt, "o-o-p roundtrip ptl={} adl={}", ptl, adl);
             }
@@ -1347,7 +1358,7 @@ mod tests {
             let mut blob = ct;
             blob.extend_from_slice(&tag);
             let mut buf = blob.clone();
-            unsafe { ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad) }
+            ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
                 .unwrap_or_else(|e| panic!("in-place roundtrip failed ptl={}: {e}", ptl));
             assert_eq!(&buf[..ptl], &pt, "in-place roundtrip ptl={}", ptl);
         }

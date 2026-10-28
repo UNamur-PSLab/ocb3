@@ -11,13 +11,27 @@ one buffer for protocol-level controls. The decryption is atomic and
 does not let the application play with partial yet not authenticated
 plaintexts.
 
-## Encryption
-
 The library has the current following constraints:
 
 - plaintext and associated data are at most `MAX_PT_SIZE` bytes (2^20 - 128);
-- the calling CPU must support AVX, AES-NI, SSSE3 and SSE4.1. There is
-  no automatic detection currently.
+- the crate is only built for x86_64 targets compiled with the `avx`, `aes`,
+  `ssse3` and `sse4.1` target features. This requirement is detected at
+  compile time: on a target without them the build fails with an explanatory
+  error. The calling CPU must support the features (there is no runtime
+  detection). See [Building](#building).
+
+## Building
+
+This repository ships a `.cargo/config.toml` that enables the required
+target features for all local builds, so `cargo test` and `cargo bench`
+work out of the box. To build explicitly, for instance as a dependency
+built outside this repository:
+
+```
+RUSTFLAGS="-C target-feature=+avx,+aes,+ssse3,+sse4.1" cargo build
+```
+
+## Encryption
 
 We can encrypt using the API either **in place**, or **out of place**
 from a contiguous buffer, or **out of place** from a scattered buffer.
@@ -37,9 +51,7 @@ let mut buf = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 buf[..pt.len()].copy_from_slice(pt);
 
 let mut ctx = AEctx::new(&key);
-unsafe {
-    ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
-}
+ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
 // buf[..pt.len()] is now the ciphertext, buf[pt.len()..] the tag
 ```
 
@@ -56,14 +68,12 @@ let pt: &[u8] = b"some application data";
 let mut ct = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 
 let mut ctx = AEctx::new(&key);
-unsafe {
-    ctx.ae_encrypt(
-        EncryptIO::OutOfPlace { in_pt: PlainText::Contiguous(pt), out: &mut ct },
-        &nonce,
-        ad,
-    )
-    .unwrap();
-}
+ctx.ae_encrypt(
+    EncryptIO::OutOfPlace { in_pt: PlainText::Contiguous(pt), out: &mut ct },
+    &nonce,
+    ad,
+)
+.unwrap();
 ```
 
 **Scattered plaintext.** When the protocol-level control bytes and the
@@ -83,17 +93,15 @@ let payload: &[u8] = b"application data";
 let mut ct = vec![0u8; control.len() + payload.len() + ocb3::OCB_TAG_LEN as usize];
 
 let mut ctx = AEctx::new(&key);
-unsafe {
-    ctx.ae_encrypt(
-        EncryptIO::OutOfPlace {
-            in_pt: PlainText::Scattered(control, payload),
-            out: &mut ct,
-        },
-        &nonce,
-        ad,
-    )
-    .unwrap();
-}
+ctx.ae_encrypt(
+    EncryptIO::OutOfPlace {
+        in_pt: PlainText::Scattered(control, payload),
+        out: &mut ct,
+    },
+    &nonce,
+    ad,
+)
+.unwrap();
 ```
 
 A size violation returns `Err(CryptoError::DestinationSizeUnfit)` or
@@ -122,10 +130,8 @@ let mut buf = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 buf[..pt.len()].copy_from_slice(pt);
 
 let mut ctx = AEctx::new(&key);
-unsafe {
-    ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
-    ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
-}
+ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
+ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
 assert_eq!(&buf[..pt.len()], pt); // plaintext recovered, tag preserved
 ```
 
@@ -143,24 +149,20 @@ let ad: &[u8] = b"protocol header";
 let pt: &[u8] = b"some application data";
 let mut ct = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 let mut ctx = AEctx::new(&key);
-unsafe {
-    ctx.ae_encrypt(
-        EncryptIO::OutOfPlace { in_pt: PlainText::Contiguous(pt), out: &mut ct },
-        &nonce,
-        ad,
-    )
-    .unwrap();
-}
+ctx.ae_encrypt(
+    EncryptIO::OutOfPlace { in_pt: PlainText::Contiguous(pt), out: &mut ct },
+    &nonce,
+    ad,
+)
+.unwrap();
 
 let mut out = vec![0u8; ct.len()];
-unsafe {
-    ctx.ae_decrypt(
-        DecryptIO::OutOfPlace { in_ct: &ct, out_pt: &mut out },
-        &nonce,
-        ad,
-    )
-    .unwrap();
-}
+ctx.ae_decrypt(
+    DecryptIO::OutOfPlace { in_ct: &ct, out_pt: &mut out },
+    &nonce,
+    ad,
+)
+.unwrap();
 ```
 
 ## Benchmarks

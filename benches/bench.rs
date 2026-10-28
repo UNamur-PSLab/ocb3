@@ -7,14 +7,12 @@ const SPEC_KEY: [u8; 16] = [
 ];
 
 fn encrypt_in_place(in_pt: &mut [u8], nonce: &[u8; 12], aad: &[u8], ctx: &mut AEctx) {
-    unsafe {
-        ctx.ae_encrypt(
-            EncryptIO::InPlace(black_box(in_pt)),
-            black_box(nonce),
-            black_box(aad),
-        )
-        .expect("encrypt failed");
-    }
+    ctx.ae_encrypt(
+        EncryptIO::InPlace(black_box(in_pt)),
+        black_box(nonce),
+        black_box(aad),
+    )
+    .expect("encrypt failed");
     black_box(in_pt);
 }
 
@@ -25,17 +23,15 @@ fn encrypt_out_of_place(
     out: &mut [u8],
     ctx: &mut AEctx,
 ) {
-    unsafe {
-        ctx.ae_encrypt(
-            EncryptIO::OutOfPlace {
-                in_pt: PlainText::Contiguous(black_box(in_pt)),
-                out: black_box(out),
-            },
-            black_box(nonce),
-            black_box(aad),
-        )
-        .expect("encrypt failed");
-    }
+    ctx.ae_encrypt(
+        EncryptIO::OutOfPlace {
+            in_pt: PlainText::Contiguous(black_box(in_pt)),
+            out: black_box(out),
+        },
+        black_box(nonce),
+        black_box(aad),
+    )
+    .expect("encrypt failed");
     black_box(out);
 }
 
@@ -47,29 +43,25 @@ fn encrypt_out_of_place_scattered(
     out: &mut [u8],
     ctx: &mut AEctx,
 ) {
-    unsafe {
-        ctx.ae_encrypt(
-            EncryptIO::OutOfPlace {
-                in_pt: PlainText::Scattered(black_box(in_pt1), black_box(in_pt2)),
-                out: black_box(out),
-            },
-            black_box(nonce),
-            black_box(aad),
-        )
-        .expect("encrypt failed");
-    }
+    ctx.ae_encrypt(
+        EncryptIO::OutOfPlace {
+            in_pt: PlainText::Scattered(black_box(in_pt1), black_box(in_pt2)),
+            out: black_box(out),
+        },
+        black_box(nonce),
+        black_box(aad),
+    )
+    .expect("encrypt failed");
     black_box(out);
 }
 
 fn decrypt_in_place(in_ct: &mut [u8], nonce: &[u8; 12], aad: &[u8], ctx: &mut AEctx) {
-    unsafe {
-        ctx.ae_decrypt(
-            DecryptIO::InPlace(black_box(in_ct)),
-            black_box(nonce),
-            black_box(aad),
-        )
-        .expect("decrypt failed");
-    }
+    ctx.ae_decrypt(
+        DecryptIO::InPlace(black_box(in_ct)),
+        black_box(nonce),
+        black_box(aad),
+    )
+    .expect("decrypt failed");
     black_box(in_ct);
 }
 
@@ -142,11 +134,9 @@ fn criterion_benchmark(c: &mut Criterion) {
                 || {
                     nonce[11] = nonce[11].wrapping_add(1);
                     let mut in_ct = vec![0u8; *s as usize + 16];
-                    unsafe {
-                        setup_ctx
-                            .ae_encrypt(EncryptIO::InPlace(&mut in_ct), &nonce, &[])
-                            .expect("encrypt failed");
-                    }
+                    setup_ctx
+                        .ae_encrypt(EncryptIO::InPlace(&mut in_ct), &nonce, &[])
+                        .expect("encrypt failed");
                     (in_ct, nonce)
                 },
                 |(in_ct, iter_nonce)| decrypt_in_place(in_ct, iter_nonce, &[], &mut bench_ctx),

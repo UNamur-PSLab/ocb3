@@ -32,7 +32,7 @@ impl<'a> PlainText<'a> {
             Self::Scattered(pt1, pt2) => pt1.len() + pt2.len(),
         }
     }
-    
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -148,9 +148,60 @@ pub enum CryptoError {
     UnSupported,
 }
 
+// The SIMD implementation is only compiled for x86_64 targets that have the
+// `avx`, `aes`, `ssse3` and `sse4.1` target features enabled at compile time.
+// This is detected at compile time: on any other target the crate fails to
+// build with an explanatory message instead of emitting code that would trap
+// at run time.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx",
+    target_feature = "aes",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+))]
 mod aes;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx",
+    target_feature = "aes",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+))]
 pub mod ocb;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx",
+    target_feature = "aes",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+))]
 pub use ocb::AEctx;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx",
+    target_feature = "aes",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+))]
 mod sse;
+
+// `not(doctest)`: rustdoc re-compiles this crate for the doctests without the
+// `build.rustflags` from .cargo/config.toml, so the gate is not satisfied
+// there; the doctest compilation must not fail on it.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx",
+    target_feature = "aes",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+)))]
+#[cfg(not(doctest))]
+compile_error!(
+    "ocb3 requires an x86_64 target with the `avx`, `aes`, `ssse3` and `sse4.1` \
+     target features enabled at compile time. Build with \
+     RUSTFLAGS=\"-C target-feature=+avx,+aes,+ssse3,+sse4.1"
+);

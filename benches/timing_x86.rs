@@ -209,9 +209,7 @@ fn main() -> ExitCode {
         nonce.0[11] = 0;
         let buf_len = len + OCB_TAG_LEN as usize;
         do_timing!(med, {
-            unsafe {
-                let _ = ctx.ae_encrypt(EncryptIO::InPlace(&mut pt.0[..buf_len]), &nonce.0, &[]);
-            }
+            let _ = ctx.ae_encrypt(EncryptIO::InPlace(&mut pt.0[..buf_len]), &nonce.0, &[]);
             nonce.0[11] = nonce.0[11].wrapping_add(1);
         });
         let tmpd = (med.get() as f64) / ((len as f64) * (N as f64));
