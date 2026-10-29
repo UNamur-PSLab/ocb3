@@ -62,11 +62,34 @@ pub(crate) fn storeu_block_with_offset<T>(a: *mut T, val: __m128i, offset: usize
     unsafe { _mm_storeu_si128(a.add(offset) as *mut __m128i, val) }
 }
 
-/// Byte-wise blend: take each byte from `b` where the matching mask byte is 0x80,
-/// otherwise from `a`.
+/// Byte-wise blend: take each byte from `b` where the matching mask byte is set,
+/// otherwise from `a`, byte per byte.
+///
+/// https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_blendv_epi8&ig_expand=487
 #[inline(always)]
 pub(crate) fn blendv_block(a: __m128i, b: __m128i, mask: __m128i) -> __m128i {
     unsafe { _mm_blendv_epi8(a, b, mask) }
+}
+
+/// Byte-wise shuffle / zeroing according to control mask `mask` (`vpshufb`).
+#[inline(always)]
+pub(crate) fn shuffle_block(a: __m128i, mask: __m128i) -> __m128i {
+    unsafe { _mm_shuffle_epi8(a, mask) }
+}
+
+#[repr(align(16))]
+struct ShiftWindow([u8; 32]);
+
+static SHIFT_LEFT_SHUF: ShiftWindow = ShiftWindow([
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+]);
+
+/// Returns a control mask for shifting a block left by `k` bytes (`k in 1..=15`):
+#[inline(always)]
+pub(crate) fn shift_left_mask(k: usize) -> __m128i {
+    debug_assert!((1..=15).contains(&k), "shift_left_mask: k must be 1..=15");
+    unsafe { _mm_loadu_si128(SHIFT_LEFT_SHUF.0.as_ptr().add(16 - k) as *const __m128i) }
 }
 
 /// Bounded read from a 16-entry L table.

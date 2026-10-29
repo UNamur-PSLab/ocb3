@@ -93,6 +93,19 @@ impl AEctx {
     }
 
     #[inline(always)]
+    fn load_partial_block(ptr: *const u8, len: usize) -> __m128i {
+        // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
+        // within the same page, overreading partial bytes cannot cross into an unmapped
+        // page and will never cause a page fault. Otherwise we safely copy up to page
+        // boundary.
+        if ((ptr as usize) & PAGE_OFFSET_MASK) <= PAGE_SIZE_4K - 16 {
+            loadu_block(ptr as *const __m128i)
+        } else {
+            load_padded_tail_cold(ptr, len)
+        }
+    }
+
+    #[inline(always)]
     fn load_tail_padded(ptr: *const u8, len: usize, mask: __m128i) -> __m128i {
         // On x86-64, virtual memory pages are at least 4 KiB. If the 16-byte load stays
         // within the same page, overreading partial bytes cannot cross into an unmapped
@@ -937,34 +950,37 @@ impl AEctx {
                             (ct_ptr, offset, checksum) =
                                 self.enc_tail(pt1_ptr, rem_pt1, ct_ptr, offset, checksum);
                         } else if rem_pt1 + pt2.len() < 16 {
-                            let total_tail = rem_pt1 + pt2.len();
-                            let mut tmp = [0u8; 16];
-                            core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
-                            core::ptr::copy_nonoverlapping(
+                            let pt2b = Self::load_tail_padded(
                                 pt2_ptr,
-                                tmp.as_mut_ptr().add(rem_pt1),
                                 pt2.len(),
+                                TAIL_STORE_MASK.get(pt2.len()),
                             );
-                            (ct_ptr, offset, checksum) =
-                                self.enc_tail(tmp.as_ptr(), total_tail, ct_ptr, offset, checksum);
+                            // Shift pt2b left by rem_pt1 bytes and blend with pt1 using the
+                            // same control mask
+                            let shuf = shift_left_mask(rem_pt1);
+                            let pt2b = shuffle_block(pt2b, shuf);
+                            let pt1 = Self::load_partial_block(pt1_ptr, rem_pt1);
+                            let blended = blendv_block(pt2b, pt1, shuf);
+                            checksum = xor_block(checksum, blended);
+                            offset = xor_block(offset, self.lstar);
+                            let pad = self.encrypt_key.aes_encrypt_block(offset);
+                            let ct_block = xor_block(blended, pad);
+                            storeu_block(ct_ptr as *mut __m128i, ct_block);
+                            ct_ptr = ct_ptr.add(rem_pt1 + pt2.len());
                         } else {
                             // Reassemble one full block from pt1 tail + pt2 head
                             let need = 16 - rem_pt1;
-                            let mut tmp = [0u8; 16];
-                            core::ptr::copy_nonoverlapping(pt1_ptr, tmp.as_mut_ptr(), rem_pt1);
-                            core::ptr::copy_nonoverlapping(
-                                pt2_ptr,
-                                tmp.as_mut_ptr().add(rem_pt1),
-                                need,
-                            );
+                            let shuf = shift_left_mask(rem_pt1);
+                            let pt2b = shuffle_block(Self::load_partial_block(pt2_ptr, need), shuf);
+                            let pt1 = Self::load_partial_block(pt1_ptr, rem_pt1);
+                            let block = blendv_block(pt2b, pt1, shuf);
 
-                            offset = self.enc_single_block_local(
-                                tmp.as_ptr(),
-                                ct_ptr,
-                                &mut block_num,
-                                offset,
-                                &mut checksum,
-                            );
+                            block_num += 1;
+                            let tz = block_num.trailing_zeros() as usize;
+                            offset = xor_block(offset, table_get(&self.l, tz));
+                            let ct = self.encrypt_key.aes_encrypt_block(xor_block(offset, block));
+                            storeu_block(ct_ptr as *mut __m128i, xor_block(ct, offset));
+                            checksum = xor_block(checksum, block);
                             ct_ptr = ct_ptr.add(16);
                             pt2_ptr = pt2_ptr.add(need);
 
@@ -1166,6 +1182,49 @@ mod tests {
     fn spec_vectors() {
         for &(ptl, adl, ct_exp, tag_exp) in &SPEC_VECTORS {
             check_vector(ptl, adl, ct_exp, tag_exp);
+        }
+    }
+
+    /// Differential coverage for the scattered branch where the two tails
+    /// form a single partial block (`rem_pt1 + pt2.len() < 16`), which the
+    /// spec vectors (pt_len multiples of 8) do not exercise for
+    /// `rem_pt1 >= 8`. Scattered encryption must match contiguous
+    /// encryption byte for byte, and the result must decrypt back.
+    #[test]
+    fn scattered_two_tail_differential() {
+        for ptl in 1..=64usize {
+            let (pt, ad) = (spec_data(ptl), spec_data(ptl / 2));
+
+            let mut ctx = AEctx::new(&SPEC_KEY);
+            let (ct_cont, tag_cont) = enc_contiguous(&mut ctx, &SPEC_NONCE, &pt, &ad);
+
+            let mut ctx = AEctx::new(&SPEC_KEY);
+            for split in 0..=ptl {
+                let (ct, tag) = enc_scattered(&mut ctx, &SPEC_NONCE, &pt, split, &ad);
+                assert_eq!(
+                    ct, ct_cont,
+                    "scattered split={} ct mismatch for ptl={}",
+                    split, ptl
+                );
+                assert_eq!(
+                    tag, tag_cont,
+                    "scattered split={} tag mismatch for ptl={}",
+                    split, ptl
+                );
+            }
+
+            // The (identical) ciphertext must decrypt back to the plaintext.
+            let mut buf = ct_cont;
+            buf.extend_from_slice(&tag_cont);
+            let mut ctx = AEctx::new(&SPEC_KEY);
+            ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
+                .expect("decrypt failed");
+            assert_eq!(
+                &buf[..ptl],
+                pt.as_slice(),
+                "decrypt roundtrip mismatch for ptl={}",
+                ptl
+            );
         }
     }
 
