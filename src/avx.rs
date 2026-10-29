@@ -1,4 +1,3 @@
-/// Requires SSE3, SSE4.1
 use core::arch::x86_64::*;
 
 // from https://github.com/rust-lang-nursery/stdsimd/pull/479 not yet merged

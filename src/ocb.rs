@@ -2,9 +2,9 @@
 //!
 //! # Compile-time feature detection
 //!
-//! This module is only compiled on x86_64 targets built with the `avx`,
-//! `aes`, `ssse3` and `sse4.1` target features. The check happens at compile
-//! time in `lib.rs` (`#[cfg(target_feature = ...)]`): on any other target the
+//! This module is only compiled on x86_64 targets built with the `avx` and
+//! `aes` target features. The check happens at compile time in `lib.rs`
+//! (`#[cfg(target_feature = ...)]`): on any other target the
 //! crate fails to build with an explanatory message instead of emitting code
 //! that would trap at run time.
 use crate::DecryptIO;
@@ -13,7 +13,7 @@ use crate::OCB_TAG_LEN;
 use crate::PlainText;
 use crate::Result;
 use crate::aes::AesKey;
-use crate::sse::*;
+use crate::avx::*;
 use core::arch::x86_64::*;
 
 const L_TABLE_SZ: usize = 16;
@@ -41,7 +41,7 @@ impl AEctx {
         unsafe { Self::new_inner(key) }
     }
 
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[target_feature(enable = "avx,aes")]
     unsafe fn new_inner(key: &[u8]) -> Self {
         // Safety: needs to be 16-bytes aligned.
         let zero = zero_block();
@@ -289,7 +289,7 @@ impl AEctx {
     /// `block_num`. Uses all 16 XMM registers with zero stack spills via prewhitened offsets
     /// and a telescoping offset-whitened checksum.
     #[allow(clippy::pointers_in_nomem_asm_block)]
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[target_feature(enable = "avx,aes")]
     #[inline(never)]
     unsafe fn enc_bpi_loop(
         &self,
@@ -700,7 +700,7 @@ impl AEctx {
     /// is wiped and `Err(CryptoError::TagInvalid)` is returned.
     pub fn ae_decrypt(&mut self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         // SAFETY: this crate is only compiled for x86_64 targets with the
-        // `avx`, `aes`, `ssse3` and `sse4.1` target features enabled (see the
+        // `avx` and `aes` target features enabled (see the
         // module-level note), so the feature requirement of `ae_decrypt_inner`
         // is met. The pointer invariants it relies on are established by
         // `io.validate()`, which is its first operation.
@@ -709,10 +709,10 @@ impl AEctx {
 
     /// # Safety
     ///
-    /// Requires the `avx`, `aes`, `ssse3` and `sse4.1` target features to be
+    /// Requires the `avx` and `aes` target features to be
     /// enabled at compile time for the calling context; this crate guarantees that in `lib.rs`'s
     /// module declaration.
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[target_feature(enable = "avx,aes")]
     unsafe fn ae_decrypt_inner(
         &mut self,
         io: DecryptIO,
@@ -883,7 +883,7 @@ impl AEctx {
     /// information and application-level data.
     pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         // SAFETY: this crate is only compiled for x86_64 targets with the
-        // `avx`, `aes`, `ssse3` and `sse4.1` target features enabled (see the
+        // `avx` and `aes` target features enabled (see the
         // module-level note), so the feature requirement of `ae_encrypt_inner`
         // is met. The pointer invariants it relies on are established by
         // `io.validate()`, which is its first operation.
@@ -892,10 +892,10 @@ impl AEctx {
 
     /// # Safety
     ///
-    /// Requires the `avx`, `aes`, `ssse3` and `sse4.1` target features to be
+    /// Requires the `avx` and `aes` target features to be
     /// enabled at compile time for the calling context; this crate guarrantees that in `lib.rs`'s
     /// module declaration.
-    #[target_feature(enable = "avx,aes,ssse3,sse4.1")]
+    #[target_feature(enable = "avx,aes")]
     unsafe fn ae_encrypt_inner(
         &mut self,
         io: EncryptIO,
