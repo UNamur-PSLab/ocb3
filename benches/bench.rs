@@ -65,7 +65,7 @@ fn decrypt_in_place(in_ct: &mut [u8], nonce: &[u8; 12], aad: &[u8], ctx: &mut AE
     black_box(in_ct);
 }
 
-fn criterion_benchmark(c: &mut Criterion) {
+fn criterion_benchmark(c: &mut Criterion<CPUTime>) {
     let mut group = c.benchmark_group("encrypt/decrypt ");
 
     // Matching default OpenSSL's speed test sizes
@@ -161,9 +161,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                         let aad = vec![0u8; hdr_size];
                         (in_pt, aad, nonce)
                     },
-                    |(in_pt, aad, iter_nonce)| {
-                        encrypt_in_place(in_pt, iter_nonce, aad, &mut ctx)
-                    },
+                    |(in_pt, aad, iter_nonce)| encrypt_in_place(in_pt, iter_nonce, aad, &mut ctx),
                     BatchSize::SmallInput,
                 )
             },
@@ -260,5 +258,15 @@ fn criterion_benchmark(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, criterion_benchmark);
+mod bench_util;
+use bench_util::*;
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .with_measurement(CPUTime)
+        .sample_size(500);
+    targets = criterion_benchmark
+}
+
 criterion_main!(benches);
