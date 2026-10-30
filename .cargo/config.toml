@@ -1,0 +1,7 @@
+# ocb3 is only built on x86_64 when the `avx` and `aes` target features are
+# enabled at compile time (see the compile_error! in lib.rs). `avx` implies
+# the SSE features the intrinsics use (SSE4.1 being the highest), so these
+# two flags are sufficient. Enabling them here makes every local build
+# (tests, benches, examples) take the safe API path.
+[build]
+rustflags = ["-Ctarget-feature=+avx,+aes"]

@@ -90,7 +90,8 @@ let ad: &[u8] = b"protocol header";
 
 let control: &[u8] = b"frame header";
 let payload: &[u8] = b"application data";
-let mut ct = vec![0u8; control.len() + payload.len() + ocb3::OCB_TAG_LEN as usize];
+let mut ct = vec![0u8; control.len() + payload.len() + ocb3::OCB_TAG_LEN
+as usize];
 
 let mut ctx = AEctx::new(&key);
 ctx.ae_encrypt(
