@@ -28,7 +28,7 @@ work out of the box. To build explicitly, for instance as a dependency
 built outside this repository:
 
 ```
-RUSTFLAGS="-C target-feature=+avx,+aes,+ssse3,+sse4.1" cargo build
+RUSTFLAGS="-C target-feature=+avx,+aes" cargo build
 ```
 
 ## Encryption
