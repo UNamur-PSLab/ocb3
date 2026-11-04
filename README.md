@@ -50,7 +50,7 @@ let pt: &[u8] = b"some application data";
 let mut buf = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 buf[..pt.len()].copy_from_slice(pt);
 
-let mut ctx = AEctx::new(&key);
+let ctx = AEctx::new(&key);
 ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
 // buf[..pt.len()] is now the ciphertext, buf[pt.len()..] the tag
 ```
@@ -67,7 +67,7 @@ let ad: &[u8] = b"protocol header";
 let pt: &[u8] = b"some application data";
 let mut ct = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 
-let mut ctx = AEctx::new(&key);
+let ctx = AEctx::new(&key);
 ctx.ae_encrypt(
     EncryptIO::OutOfPlace { in_pt: PlainText::Contiguous(pt), out: &mut ct },
     &nonce,
@@ -93,7 +93,7 @@ let payload: &[u8] = b"application data";
 let mut ct = vec![0u8; control.len() + payload.len() + ocb3::OCB_TAG_LEN
 as usize];
 
-let mut ctx = AEctx::new(&key);
+let ctx = AEctx::new(&key);
 ctx.ae_encrypt(
     EncryptIO::OutOfPlace {
         in_pt: PlainText::Scattered(control, payload),
@@ -130,7 +130,7 @@ let pt: &[u8] = b"some application data";
 let mut buf = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
 buf[..pt.len()].copy_from_slice(pt);
 
-let mut ctx = AEctx::new(&key);
+let ctx = AEctx::new(&key);
 ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
 ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &nonce, ad).unwrap();
 assert_eq!(&buf[..pt.len()], pt); // plaintext recovered, tag preserved
@@ -149,7 +149,7 @@ let ad: &[u8] = b"protocol header";
 
 let pt: &[u8] = b"some application data";
 let mut ct = vec![0u8; pt.len() + ocb3::OCB_TAG_LEN as usize];
-let mut ctx = AEctx::new(&key);
+let ctx = AEctx::new(&key);
 ctx.ae_encrypt(
     EncryptIO::OutOfPlace { in_pt: PlainText::Contiguous(pt), out: &mut ct },
     &nonce,

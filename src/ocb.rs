@@ -15,6 +15,7 @@ use crate::Result;
 use crate::aes::AesKey;
 use crate::avx::*;
 use core::arch::x86_64::*;
+use std::cell::RefCell;
 
 const L_TABLE_SZ: usize = 16;
 const BPI: usize = 8;
@@ -28,10 +29,10 @@ pub struct AEctx {
     lstar: __m128i,
     ldollar: __m128i,
     l: [__m128i; L_TABLE_SZ],
-    cached_top: __m128i,
+    cached_top: RefCell<__m128i>,
     decrypt_key: AesKey,
     encrypt_key: AesKey,
-    ktop_str: [u64; 3],
+    ktop_str: RefCell<[u64; 3]>,
 }
 
 impl AEctx {
@@ -49,16 +50,16 @@ impl AEctx {
             lstar: zero,
             ldollar: zero,
             l: [zero; L_TABLE_SZ],
-            cached_top: zero,
+            cached_top: RefCell::new(zero),
             decrypt_key: AesKey::default(),
             encrypt_key: AesKey::default(),
-            ktop_str: [0u64; 3],
+            ktop_str: RefCell::new([0u64; 3]),
         };
 
         // Key dependent values
         ctx.encrypt_key.aes_128_key_expansion(key);
         ctx.decrypt_key.aes_set_key_fast(&ctx.encrypt_key);
-        ctx.lstar = ctx.encrypt_key.aes_encrypt_block(ctx.cached_top);
+        ctx.lstar = ctx.encrypt_key.aes_encrypt_block(*ctx.cached_top.borrow());
         let mut tmp_blk = swap_if_le(ctx.lstar);
         tmp_blk = double(tmp_blk);
         ctx.ldollar = swap_if_le(tmp_blk);
@@ -74,22 +75,22 @@ impl AEctx {
     }
 
     #[inline(always)]
-    fn gen_offset_from_nonce(&mut self, nonce: &[u8; 12]) -> __m128i {
+    fn gen_offset_from_nonce(&self, nonce: &[u8; 12]) -> __m128i {
         let n_hi = unsafe { core::ptr::read_unaligned(nonce.as_ptr() as *const u32) };
         let n_lo = unsafe { core::ptr::read_unaligned(nonce.as_ptr().add(4) as *const u64) };
         let idx = (nonce[11] & 0x3f) as i32;
         let lo_qword = 0x0100_0000u64 | ((n_hi as u64) << 32);
         let hi_qword = n_lo & !(0x3fu64 << 56);
         let mut bl = unsafe { _mm_set_epi64x(hi_qword as i64, lo_qword as i64) };
-        if equal_blocks(bl, self.cached_top) == 0 {
-            self.cached_top = bl;
+        if equal_blocks(bl, *self.cached_top.borrow()) == 0 {
+            self.cached_top.replace(bl);
             bl = self.encrypt_key.aes_encrypt_block(bl);
-            [self.ktop_str[0], self.ktop_str[1]] = m128i_to_bswap_u64x2(bl);
-            self.ktop_str[2] =
-                self.ktop_str[0] ^ (self.ktop_str[0] << 8) ^ (self.ktop_str[1] >> 56);
+            let mut ktop_str = self.ktop_str.borrow_mut();
+            [ktop_str[0], ktop_str[1]] = m128i_to_bswap_u64x2(bl);
+            ktop_str[2] = ktop_str[0] ^ (ktop_str[0] << 8) ^ (ktop_str[1] >> 56);
         }
 
-        gen_offset(&self.ktop_str, idx)
+        gen_offset(&self.ktop_str.borrow(), idx)
     }
 
     #[inline(always)]
@@ -698,7 +699,7 @@ impl AEctx {
     /// Decrypts and verifies `io` using `nonce` and associated data `ad`. On a
     /// tag mismatch everything that may have been written to the destination
     /// is wiped and `Err(CryptoError::TagInvalid)` is returned.
-    pub fn ae_decrypt(&mut self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+    pub fn ae_decrypt(&self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         // SAFETY: this crate is only compiled for x86_64 targets with the
         // `avx` and `aes` target features enabled (see the
         // module-level note), so the feature requirement of `ae_decrypt_inner`
@@ -714,7 +715,7 @@ impl AEctx {
     /// module declaration.
     #[target_feature(enable = "avx,aes")]
     unsafe fn ae_decrypt_inner(
-        &mut self,
+        &self,
         io: DecryptIO,
         nonce: &[u8; 12],
         ad: &[u8],
@@ -881,7 +882,7 @@ impl AEctx {
     /// Note that `io` may contain a scattered plaintext of two &[u8] for the out of place
     /// encryption. This is designed for encrypted transports encrypting protocol-level control
     /// information and application-level data.
-    pub fn ae_encrypt(&mut self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
+    pub fn ae_encrypt(&self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         // SAFETY: this crate is only compiled for x86_64 targets with the
         // `avx` and `aes` target features enabled (see the
         // module-level note), so the feature requirement of `ae_encrypt_inner`
@@ -897,7 +898,7 @@ impl AEctx {
     /// module declaration.
     #[target_feature(enable = "avx,aes")]
     unsafe fn ae_encrypt_inner(
-        &mut self,
+        &self,
         io: EncryptIO,
         nonce: &[u8; 12],
         ad: &[u8],
@@ -1061,7 +1062,7 @@ mod tests {
 
     /// Encrypt out-of-place with contiguous plaintext. Returns (ct, tag).
     fn enc_contiguous(
-        ctx: &mut AEctx,
+        ctx: &AEctx,
         nonce: &[u8; 12],
         pt: &[u8],
         ad: &[u8],
@@ -1082,7 +1083,7 @@ mod tests {
 
     /// Encrypt in place. Returns (ct, tag).
     fn enc_in_place(
-        ctx: &mut AEctx,
+        ctx: &AEctx,
         nonce: &[u8; 12],
         pt: &[u8],
         ad: &[u8],
@@ -1097,7 +1098,7 @@ mod tests {
 
     /// Encrypt out-of-place with scattered plaintext split at `split`. Returns (ct, tag).
     fn enc_scattered(
-        ctx: &mut AEctx,
+        ctx: &AEctx,
         nonce: &[u8; 12],
         pt: &[u8],
         split: usize,
@@ -1122,8 +1123,8 @@ mod tests {
     fn check_vector(ptl: usize, adl: usize, ct_exp: &[u8], tag_exp: &[u8]) {
         let (pt, ad) = (spec_data(ptl), spec_data(adl));
 
-        let mut ctx = AEctx::new(&SPEC_KEY);
-        let (ct, tag) = enc_in_place(&mut ctx, &SPEC_NONCE, &pt, &ad);
+        let ctx = AEctx::new(&SPEC_KEY);
+        let (ct, tag) = enc_in_place(&ctx, &SPEC_NONCE, &pt, &ad);
         assert_eq!(
             ct.as_slice(),
             ct_exp,
@@ -1139,8 +1140,8 @@ mod tests {
             adl
         );
 
-        let mut ctx = AEctx::new(&SPEC_KEY);
-        let (ct, tag) = enc_contiguous(&mut ctx, &SPEC_NONCE, &pt, &ad);
+        let ctx = AEctx::new(&SPEC_KEY);
+        let (ct, tag) = enc_contiguous(&ctx, &SPEC_NONCE, &pt, &ad);
         assert_eq!(
             ct.as_slice(),
             ct_exp,
@@ -1156,9 +1157,9 @@ mod tests {
             adl
         );
 
-        let mut ctx = AEctx::new(&SPEC_KEY);
+        let ctx = AEctx::new(&SPEC_KEY);
         for split in 0..=ptl {
-            let (ct, tag) = enc_scattered(&mut ctx, &SPEC_NONCE, &pt, split, &ad);
+            let (ct, tag) = enc_scattered(&ctx, &SPEC_NONCE, &pt, split, &ad);
             assert_eq!(
                 ct.as_slice(),
                 ct_exp,
@@ -1195,12 +1196,12 @@ mod tests {
         for ptl in 1..=64usize {
             let (pt, ad) = (spec_data(ptl), spec_data(ptl / 2));
 
-            let mut ctx = AEctx::new(&SPEC_KEY);
-            let (ct_cont, tag_cont) = enc_contiguous(&mut ctx, &SPEC_NONCE, &pt, &ad);
+            let ctx = AEctx::new(&SPEC_KEY);
+            let (ct_cont, tag_cont) = enc_contiguous(&ctx, &SPEC_NONCE, &pt, &ad);
 
-            let mut ctx = AEctx::new(&SPEC_KEY);
+            let ctx = AEctx::new(&SPEC_KEY);
             for split in 0..=ptl {
-                let (ct, tag) = enc_scattered(&mut ctx, &SPEC_NONCE, &pt, split, &ad);
+                let (ct, tag) = enc_scattered(&ctx, &SPEC_NONCE, &pt, split, &ad);
                 assert_eq!(
                     ct, ct_cont,
                     "scattered split={} ct mismatch for ptl={}",
@@ -1216,7 +1217,7 @@ mod tests {
             // The (identical) ciphertext must decrypt back to the plaintext.
             let mut buf = ct_cont;
             buf.extend_from_slice(&tag_cont);
-            let mut ctx = AEctx::new(&SPEC_KEY);
+            let ctx = AEctx::new(&SPEC_KEY);
             ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
                 .expect("decrypt failed");
             assert_eq!(
@@ -1232,10 +1233,10 @@ mod tests {
     /// does; this exercises the per-call state resets.
     #[test]
     fn spec_vectors_reused_context() {
-        let mut ctx = AEctx::new(&SPEC_KEY);
+        let ctx = AEctx::new(&SPEC_KEY);
         for &(ptl, adl, ct_exp, tag_exp) in &SPEC_VECTORS {
             let (pt, ad) = (spec_data(ptl), spec_data(adl));
-            let (ct, tag) = enc_contiguous(&mut ctx, &SPEC_NONCE, &pt, &ad);
+            let (ct, tag) = enc_contiguous(&ctx, &SPEC_NONCE, &pt, &ad);
             assert_eq!(
                 ct.as_slice(),
                 ct_exp,
@@ -1268,7 +1269,7 @@ mod tests {
             let (pt_exp, ad) = (spec_data(ptl), dec_gen_ad(adl));
 
             // Out of place.
-            let mut ctx = AEctx::new(&SPEC_KEY);
+            let ctx = AEctx::new(&SPEC_KEY);
             let mut out = vec![0xffu8; ptl + 16];
             ctx.ae_decrypt(
                 DecryptIO::OutOfPlace {
@@ -1288,7 +1289,7 @@ mod tests {
             );
 
             // In place: the plaintext must come back and the tag must survive.
-            let mut ctx = AEctx::new(&SPEC_KEY);
+            let ctx = AEctx::new(&SPEC_KEY);
             let mut buf = ct_tag.to_vec();
             ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
                 .unwrap_or_else(|e| panic!("in-place decrypt failed ptl={} adl={}: {e}", ptl, adl));
@@ -1308,7 +1309,7 @@ mod tests {
             );
 
             // Corrupted tag must be rejected.
-            let mut ctx = AEctx::new(&SPEC_KEY);
+            let ctx = AEctx::new(&SPEC_KEY);
             let mut bad = ct_tag.to_vec();
             bad[ptl] ^= 0x01;
             assert!(
@@ -1323,7 +1324,7 @@ mod tests {
 
             // Corrupted ciphertext must be rejected.
             if ptl > 0 {
-                let mut ctx = AEctx::new(&SPEC_KEY);
+                let ctx = AEctx::new(&SPEC_KEY);
                 let mut bad = ct_tag.to_vec();
                 bad[ptl / 2] ^= 0x01;
                 assert!(
@@ -1339,7 +1340,7 @@ mod tests {
 
             // Corrupted AD must be rejected.
             if adl > 0 {
-                let mut ctx = AEctx::new(&SPEC_KEY);
+                let ctx = AEctx::new(&SPEC_KEY);
                 let mut bad_ad = ad.clone();
                 bad_ad[adl / 2] ^= 0x01;
                 assert!(
@@ -1370,8 +1371,8 @@ mod tests {
             for &adl in &ad_lens {
                 let (pt, ad) = (spec_data(ptl), spec_data(adl));
 
-                let mut ctx = AEctx::new(&SPEC_KEY);
-                let (ct, tag) = enc_in_place(&mut ctx, &SPEC_NONCE, &pt, &ad);
+                let ctx = AEctx::new(&SPEC_KEY);
+                let (ct, tag) = enc_in_place(&ctx, &SPEC_NONCE, &pt, &ad);
                 let mut blob = ct;
                 blob.extend_from_slice(&tag);
 
@@ -1412,8 +1413,8 @@ mod tests {
         }
         for ptl in [2048usize, 4096, 8192] {
             let (pt, ad) = (spec_data(ptl), spec_data(129));
-            let mut ctx = AEctx::new(&SPEC_KEY);
-            let (ct, tag) = enc_in_place(&mut ctx, &SPEC_NONCE, &pt, &ad);
+            let ctx = AEctx::new(&SPEC_KEY);
+            let (ct, tag) = enc_in_place(&ctx, &SPEC_NONCE, &pt, &ad);
             let mut blob = ct;
             blob.extend_from_slice(&tag);
             let mut buf = blob.clone();
