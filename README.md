@@ -14,11 +14,10 @@ plaintexts.
 The library has the current following constraints:
 
 - plaintext and associated data are at most `MAX_PT_SIZE` bytes (2^20 - 128);
-- the crate is only built for x86_64 targets compiled with the `avx`, `aes`,
-  `ssse3` and `sse4.1` target features. This requirement is detected at
-  compile time: on a target without them the build fails with an explanatory
-  error. The calling CPU must support the features (there is no runtime
-  detection). See [Building](#building).
+- the crate is only built for x86_64 targets compiled with the `avx` and
+  `aes` target features. This requirement is detected at compile time:
+  on a target without them the build fails with an explanatory error.
+  See [Building](#building).
 
 ## Building
 
@@ -170,10 +169,10 @@ ctx.ae_decrypt(
 
 ## AI Disclosure
 
-This code was preliminary written by a human, yet the author used a
-local AI model to improve the robustness of the implementation, finding
-bugs, writing the tests, discussing optimizations such as LLVM code
-hoisting in loops, and how to prevent it. While primarily written by a
-human, it remains unclear to what extend this library would have been
-different if AI was not used. We thanks all Jon and Jane Does from which
-the model learnt and thanks to whom it turned out to be helpful.
+This code is primarily written by a human, yet the author used a local
+AI model to improve the robustness of the implementation, finding bugs,
+writing the tests, discussing optimizations such as LLVM code hoisting
+in loops, and how to prevent it. While primarily written by a human, it
+remains unclear to what extend this library would have been different if
+AI was not used. We thanks all Jon and Jane Does from which the model
+learnt and thanks to whom it turned out to be helpful.
