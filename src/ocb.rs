@@ -15,7 +15,7 @@ use crate::Result;
 use crate::aes::AesKey;
 use crate::avx::*;
 use core::arch::x86_64::*;
-use std::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 
 const L_TABLE_SZ: usize = 16;
 const BPI: usize = 8;
@@ -29,10 +29,25 @@ pub struct AEctx {
     lstar: __m128i,
     ldollar: __m128i,
     l: [__m128i; L_TABLE_SZ],
-    cached_top: RefCell<__m128i>,
     decrypt_key: AesKey,
     encrypt_key: AesKey,
-    ktop_str: RefCell<[u64; 3]>,
+    ktop: KtopCache,
+}
+
+struct KtopCache {
+    seq: AtomicU64,
+    cached_top: [AtomicU64; 2],
+    ktop_str: [AtomicU64; 3],
+}
+
+impl Default for KtopCache {
+    fn default() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            cached_top: [AtomicU64::new(0), AtomicU64::new(0)],
+            ktop_str: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+        }
+    }
 }
 
 impl AEctx {
@@ -50,16 +65,15 @@ impl AEctx {
             lstar: zero,
             ldollar: zero,
             l: [zero; L_TABLE_SZ],
-            cached_top: RefCell::new(zero),
             decrypt_key: AesKey::default(),
             encrypt_key: AesKey::default(),
-            ktop_str: RefCell::new([0u64; 3]),
+            ktop: KtopCache::default(),
         };
 
         // Key dependent values
         ctx.encrypt_key.aes_128_key_expansion(key);
         ctx.decrypt_key.aes_set_key_fast(&ctx.encrypt_key);
-        ctx.lstar = ctx.encrypt_key.aes_encrypt_block(*ctx.cached_top.borrow());
+        ctx.lstar = ctx.encrypt_key.aes_encrypt_block(zero);
         let mut tmp_blk = swap_if_le(ctx.lstar);
         tmp_blk = double(tmp_blk);
         ctx.ldollar = swap_if_le(tmp_blk);
@@ -81,16 +95,47 @@ impl AEctx {
         let idx = (nonce[11] & 0x3f) as i32;
         let lo_qword = 0x0100_0000u64 | ((n_hi as u64) << 32);
         let hi_qword = n_lo & !(0x3fu64 << 56);
-        let mut bl = unsafe { _mm_set_epi64x(hi_qword as i64, lo_qword as i64) };
-        if equal_blocks(bl, *self.cached_top.borrow()) == 0 {
-            self.cached_top.replace(bl);
-            bl = self.encrypt_key.aes_encrypt_block(bl);
-            let mut ktop_str = self.ktop_str.borrow_mut();
-            [ktop_str[0], ktop_str[1]] = m128i_to_bswap_u64x2(bl);
-            ktop_str[2] = ktop_str[0] ^ (ktop_str[0] << 8) ^ (ktop_str[1] >> 56);
+
+        let seq1 = self.ktop.seq.load(Ordering::Acquire);
+        // 63 over 64 times, this should resolve to true:
+        if (seq1 & 1) == 0 {
+            let top0 = self.ktop.cached_top[0].load(Ordering::Relaxed);
+            let top1 = self.ktop.cached_top[1].load(Ordering::Relaxed);
+            if top0 == lo_qword && top1 == hi_qword {
+                let k0 = self.ktop.ktop_str[0].load(Ordering::Relaxed);
+                let k1 = self.ktop.ktop_str[1].load(Ordering::Relaxed);
+                let k2 = self.ktop.ktop_str[2].load(Ordering::Relaxed);
+                compiler_fence(Ordering::Acquire);
+                if self.ktop.seq.load(Ordering::Relaxed) == seq1 {
+                    return gen_offset(&[k0, k1, k2], idx);
+                }
+            }
         }
 
-        gen_offset(&self.ktop_str.borrow(), idx)
+        // Slow path, compute ktop, update and gen offset
+        let mut bl = unsafe { _mm_set_epi64x(hi_qword as i64, lo_qword as i64) };
+        bl = self.encrypt_key.aes_encrypt_block(bl);
+        let [k0, k1] = m128i_to_bswap_u64x2(bl);
+        let k2 = k0 ^ (k0 << 8) ^ (k1 >> 56);
+        let ktop_str = [k0, k1, k2];
+
+        // Cache update is no writer active.
+        if (seq1 & 1) == 0
+            && self
+                .ktop
+                .seq
+                .compare_exchange_weak(seq1, seq1 + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.ktop.cached_top[0].store(lo_qword, Ordering::Relaxed);
+            self.ktop.cached_top[1].store(hi_qword, Ordering::Relaxed);
+            self.ktop.ktop_str[0].store(k0, Ordering::Relaxed);
+            self.ktop.ktop_str[1].store(k1, Ordering::Relaxed);
+            self.ktop.ktop_str[2].store(k2, Ordering::Relaxed);
+            self.ktop.seq.store(seq1 + 2, Ordering::Release);
+        }
+
+        gen_offset(&ktop_str, idx)
     }
 
     #[inline(always)]
@@ -1421,6 +1466,53 @@ mod tests {
             ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
                 .unwrap_or_else(|e| panic!("in-place roundtrip failed ptl={}: {e}", ptl));
             assert_eq!(&buf[..ptl], &pt, "in-place roundtrip ptl={}", ptl);
+        }
+    }
+
+    fn check_sync(_: &impl Sync) {}
+
+    #[test]
+    fn ctx_must_be_sync() {
+        let ctx = AEctx::new(&SPEC_KEY);
+        check_sync(&ctx);
+    }
+
+    #[test]
+    fn ktop_cache_updated_once_per_64_sequential_nonces() {
+        let ctx = AEctx::new(&SPEC_KEY);
+        let mut nonce = [0u8; 12];
+        let mut buf = [0u8; 16 + OCB_TAG_LEN as usize];
+
+        assert_eq!(ctx.ktop.seq.load(Ordering::Relaxed), 0);
+    
+        nonce[11] = 0;
+        ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, &[])
+            .expect("encrypt failed");
+        let mut cache = [ctx.ktop.cached_top[0].load(Ordering::Relaxed), ctx.ktop.cached_top[1].load(Ordering::Relaxed)]; 
+        for i in 1..256usize {
+            nonce[11] = i as u8;
+            ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, &[])
+                .expect("encrypt failed");
+
+            if i % 64 == 0 {
+                assert!(
+                    (ctx.ktop.cached_top[0].load(Ordering::Relaxed) != cache[0]) ||
+                    (ctx.ktop.cached_top[1].load(Ordering::Relaxed) != cache[1])
+                );
+                cache = [ctx.ktop.cached_top[0].load(Ordering::Relaxed), ctx.ktop.cached_top[1].load(Ordering::Relaxed)]; 
+            } else {
+                assert_eq!(ctx.ktop.cached_top[0].load(Ordering::Relaxed), cache[0]);
+                assert_eq!(ctx.ktop.cached_top[1].load(Ordering::Relaxed), cache[1]);
+            }
+
+            // Each cache update increments `seq` by 2.
+            // Update must occur only when `i % 64 == 0` (1 time out of 64).
+            let expected_updates = (i / 64) + 1;
+            let actual_updates = (ctx.ktop.seq.load(Ordering::Relaxed) / 2) as usize;
+            assert_eq!(
+                actual_updates, expected_updates,
+                "unexpected cache update count at nonce[11]={i}"
+            );
         }
     }
 }
