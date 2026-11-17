@@ -127,7 +127,7 @@ fn criterion_benchmark(c: &mut Criterion<CPUTime>) {
         );
 
         group.bench_with_input(BenchmarkId::new("Decrypt in place", size), size, |b, s| {
-            let mut setup_ctx = AEctx::new(black_box(&SPEC_KEY));
+            let setup_ctx = AEctx::new(black_box(&SPEC_KEY));
             let mut bench_ctx = AEctx::new(black_box(&SPEC_KEY));
             let mut nonce = [0u8; 12];
             b.iter_batched_ref(

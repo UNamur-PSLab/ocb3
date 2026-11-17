@@ -13,14 +13,30 @@ pub enum PlainText<'a> {
     Scattered(&'a [u8], &'a [u8]),
 }
 
-/// An encryption can either be in place or out of place. In the case of out of place encryption
-/// we may as well have scattered plaintext.
+/// Which end of the destination buffer the externally supplied half of an
+/// [`EncryptIO::MixedPlace`] payload occupies.
+pub enum Placement {
+    Head,
+    Tail,
+}
+
+/// An encryption can be in place, out of place, or mixed, where mixed means the
+/// destination also supplies half of the plaintext. In the case of out of place
+/// encryption we may as well have scattered plaintext.
 pub enum EncryptIO<'a> {
     /// Encrypts up to .len() - OCB_TAG_LEN
     InPlace(&'a mut [u8]),
     OutOfPlace {
         in_pt: PlainText<'a>,
         out: &'a mut [u8],
+    },
+    /// Encrypts the payload held in `out`, except for the half named by `at`, which is
+    /// read from `part` instead. `out` must be exactly the payload plus the tag slot, so
+    /// the ciphertext is written back over it and the tag lands in its last 16 bytes.
+    MixedPlace {
+        out: &'a mut [u8],
+        part: &'a [u8],
+        at: Placement,
     },
 }
 
@@ -66,6 +82,21 @@ impl<'a> EncryptIO<'a> {
                 }
                 Ok(())
             }
+            Self::MixedPlace { out, part, .. } => {
+                let part_len = part.len();
+                if part_len > MAX_PT_SIZE {
+                    return Err(CryptoError::PlaintextTooLong);
+                }
+                if out.len().saturating_sub(OCB_TAG_LEN as usize) > MAX_PT_SIZE {
+                    return Err(CryptoError::PlaintextTooLong);
+                }
+                // Guarantees `out.len() - OCB_TAG_LEN - part_len` cannot underflow in the
+                // encryption path, and that the externally supplied half fits in `out`.
+                if part_len + OCB_TAG_LEN as usize > out.len() {
+                    return Err(CryptoError::DestinationSizeUnfit);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -74,14 +105,18 @@ impl<'a> EncryptIO<'a> {
         match self {
             Self::InPlace(buf) => buf.len().saturating_sub(OCB_TAG_LEN as usize),
             Self::OutOfPlace { in_pt, .. } => in_pt.len(),
+            Self::MixedPlace { out, .. } => out.len().saturating_sub(OCB_TAG_LEN as usize),
         }
     }
 
+    /// Empty means the payload is empty, which for the InPlace and MixedPlace variants is a buffer
+    /// holding nothing but the tag slot.
     #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::InPlace(buf) => buf.is_empty(),
+            Self::InPlace(buf) => buf.len() <= OCB_TAG_LEN as usize,
             Self::OutOfPlace { in_pt, .. } => in_pt.is_empty(),
+            Self::MixedPlace { out, .. } => out.len() <= OCB_TAG_LEN as usize,
         }
     }
 }
@@ -105,7 +140,6 @@ impl<'a> DecryptIO<'a> {
                 if in_ct.len() - OCB_TAG_LEN as usize > MAX_PT_SIZE {
                     return Err(CryptoError::PlaintextTooLong);
                 }
-
                 if (out_pt.len() + OCB_TAG_LEN as usize) < in_ct.len() {
                     return Err(CryptoError::DestinationSizeUnfit);
                 }

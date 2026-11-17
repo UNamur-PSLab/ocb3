@@ -10,6 +10,7 @@
 use crate::DecryptIO;
 use crate::EncryptIO;
 use crate::OCB_TAG_LEN;
+use crate::Placement;
 use crate::PlainText;
 use crate::Result;
 use crate::aes::AesKey;
@@ -724,6 +725,110 @@ impl AEctx {
         (unsafe { ct_ptr.add(data_len) }, offset, checksum)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn enc_scatter(
+        &self,
+        mut pt1_ptr: *const u8,
+        mut pt2_ptr: *const u8,
+        pt1_len: usize,
+        pt2_len: usize,
+        mut ct_ptr: *mut u8,
+        mut offset: __m128i,
+        mut checksum: __m128i,
+        mut block_num: u32,
+        ad: &[u8],
+    ) -> Result<()> {
+        let full_blocks_pt1 = pt1_len / 16;
+        let rem_pt1 = pt1_len & 15;
+
+        (pt1_ptr, ct_ptr, offset) = self.enc_aligned_blocks(
+            pt1_ptr,
+            ct_ptr,
+            full_blocks_pt1,
+            &mut block_num,
+            offset,
+            &mut checksum,
+        );
+
+        if rem_pt1 > 0 {
+            if pt2_len == 0 {
+                (ct_ptr, offset, checksum) =
+                    self.enc_tail(pt1_ptr, rem_pt1, ct_ptr, offset, checksum);
+            } else if rem_pt1 + pt2_len < 16 {
+                let pt2b = Self::load_tail_padded(pt2_ptr, pt2_len, TAIL_STORE_MASK.get(pt2_len));
+                // Shift pt2b left by rem_pt1 bytes and blend with pt1 using the
+                // same control mask
+                let shuf = shift_left_mask(rem_pt1);
+                let pt2b = shuffle_block(pt2b, shuf);
+                let pt1 = Self::load_partial_block(pt1_ptr, rem_pt1);
+                let blended = blendv_block(pt2b, pt1, shuf);
+                checksum = xor_block(checksum, blended);
+                offset = xor_block(offset, self.lstar);
+                let pad = self.encrypt_key.aes_encrypt_block(offset);
+                let ct_block = xor_block(blended, pad);
+                storeu_block(ct_ptr as *mut __m128i, ct_block);
+                unsafe {
+                    ct_ptr = ct_ptr.add(rem_pt1 + pt2_len);
+                }
+            } else {
+                // Reassemble one full block from pt1 tail + pt2 head
+                let need = 16 - rem_pt1;
+                let shuf = shift_left_mask(rem_pt1);
+                let pt2b = shuffle_block(Self::load_partial_block(pt2_ptr, need), shuf);
+                let pt1 = Self::load_partial_block(pt1_ptr, rem_pt1);
+                let block = blendv_block(pt2b, pt1, shuf);
+
+                block_num += 1;
+                let tz = block_num.trailing_zeros() as usize;
+                offset = xor_block(offset, table_get(&self.l, tz));
+                let ct = self.encrypt_key.aes_encrypt_block(xor_block(offset, block));
+                storeu_block(ct_ptr as *mut __m128i, xor_block(ct, offset));
+                checksum = xor_block(checksum, block);
+                unsafe {
+                    ct_ptr = ct_ptr.add(16);
+                    pt2_ptr = pt2_ptr.add(need);
+                }
+
+                let remaining_pt2 = pt2_len - need;
+                let full_blocks_pt2 = remaining_pt2 / 16;
+                let rem_pt2 = remaining_pt2 & 15;
+
+                (pt2_ptr, ct_ptr, offset) = self.enc_unaligned_contiguous(
+                    pt2_ptr,
+                    ct_ptr,
+                    full_blocks_pt2,
+                    &mut block_num,
+                    offset,
+                    &mut checksum,
+                );
+                if rem_pt2 > 0 {
+                    (ct_ptr, offset, checksum) =
+                        self.enc_tail(pt2_ptr, rem_pt2, ct_ptr, offset, checksum);
+                }
+            }
+        } else {
+            // rem_pt1 == 0, pt2 continues directly
+            let full_blocks_pt2 = pt2_len / 16;
+            let rem_pt2 = pt2_len & 15;
+
+            (pt2_ptr, ct_ptr, offset) = self.enc_unaligned_contiguous(
+                pt2_ptr,
+                ct_ptr,
+                full_blocks_pt2,
+                &mut block_num,
+                offset,
+                &mut checksum,
+            );
+            if rem_pt2 > 0 {
+                (ct_ptr, offset, checksum) =
+                    self.enc_tail(pt2_ptr, rem_pt2, ct_ptr, offset, checksum);
+            }
+        }
+        self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
+        return Ok(());
+    }
+
     /// Compute and store the final tag
     #[inline(always)]
     fn compute_and_store_tag(
@@ -759,12 +864,7 @@ impl AEctx {
     /// enabled at compile time for the calling context; this crate guarantees that in `lib.rs`'s
     /// module declaration.
     #[target_feature(enable = "avx,aes")]
-    unsafe fn ae_decrypt_inner(
-        &self,
-        io: DecryptIO,
-        nonce: &[u8; 12],
-        ad: &[u8],
-    ) -> Result<()> {
+    unsafe fn ae_decrypt_inner(&self, io: DecryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
         if ad.len() > crate::MAX_PT_SIZE {
             return Err(crate::CryptoError::PlaintextTooLong);
@@ -774,7 +874,11 @@ impl AEctx {
         let io_len = io.len();
 
         let (mut ct_ptr, mut pt_ptr, fail_zero_len) = match io {
-            DecryptIO::InPlace(buf) => (buf.as_ptr(), buf.as_mut_ptr(), buf.len()),
+            DecryptIO::InPlace(buf) => {
+                let pt_ptr = buf.as_mut_ptr();
+                let ct_ptr = pt_ptr as *const u8;
+                (ct_ptr, pt_ptr, buf.len())
+            },
             DecryptIO::OutOfPlace { in_ct, out_pt } => (
                 in_ct.as_ptr(),
                 out_pt.as_mut_ptr(),
@@ -942,12 +1046,7 @@ impl AEctx {
     /// enabled at compile time for the calling context; this crate guarrantees that in `lib.rs`'s
     /// module declaration.
     #[target_feature(enable = "avx,aes")]
-    unsafe fn ae_encrypt_inner(
-        &self,
-        io: EncryptIO,
-        nonce: &[u8; 12],
-        ad: &[u8],
-    ) -> Result<()> {
+    unsafe fn ae_encrypt_inner(&self, io: EncryptIO, nonce: &[u8; 12], ad: &[u8]) -> Result<()> {
         io.validate()?;
         if ad.len() > crate::MAX_PT_SIZE {
             return Err(crate::CryptoError::PlaintextTooLong);
@@ -955,137 +1054,81 @@ impl AEctx {
         let mut offset = self.gen_offset_from_nonce(nonce);
         let mut checksum = _mm_setzero_si128();
 
-        unsafe {
-            let mut block_num = 0u32;
+        let mut block_num = 0u32;
 
-            let (mut pt_ptr, mut ct_ptr, pt_len) = match io {
-                EncryptIO::InPlace(buf) => {
-                    // The buffer holds the plaintext followed by a 16-byte tag slot.
-                    (
-                        buf.as_ptr(),
-                        buf.as_mut_ptr(),
-                        buf.len() - OCB_TAG_LEN as usize,
-                    )
-                }
-                EncryptIO::OutOfPlace {
-                    in_pt: PlainText::Contiguous(pt),
-                    out,
-                } => (pt.as_ptr(), out.as_mut_ptr(), pt.len()),
-                EncryptIO::OutOfPlace {
-                    in_pt: PlainText::Scattered(pt1, pt2),
-                    out,
-                } => {
-                    let mut pt1_ptr = pt1.as_ptr();
-                    let mut pt2_ptr = pt2.as_ptr();
-                    let mut ct_ptr = out.as_mut_ptr();
-
-                    let full_blocks_pt1 = pt1.len() / 16;
-                    let rem_pt1 = pt1.len() & 15;
-
-                    (pt1_ptr, ct_ptr, offset) = self.enc_aligned_blocks(
-                        pt1_ptr,
-                        ct_ptr,
-                        full_blocks_pt1,
-                        &mut block_num,
-                        offset,
-                        &mut checksum,
-                    );
-
-                    if rem_pt1 > 0 {
-                        if pt2.is_empty() {
-                            (ct_ptr, offset, checksum) =
-                                self.enc_tail(pt1_ptr, rem_pt1, ct_ptr, offset, checksum);
-                        } else if rem_pt1 + pt2.len() < 16 {
-                            let pt2b = Self::load_tail_padded(
-                                pt2_ptr,
-                                pt2.len(),
-                                TAIL_STORE_MASK.get(pt2.len()),
-                            );
-                            // Shift pt2b left by rem_pt1 bytes and blend with pt1 using the
-                            // same control mask
-                            let shuf = shift_left_mask(rem_pt1);
-                            let pt2b = shuffle_block(pt2b, shuf);
-                            let pt1 = Self::load_partial_block(pt1_ptr, rem_pt1);
-                            let blended = blendv_block(pt2b, pt1, shuf);
-                            checksum = xor_block(checksum, blended);
-                            offset = xor_block(offset, self.lstar);
-                            let pad = self.encrypt_key.aes_encrypt_block(offset);
-                            let ct_block = xor_block(blended, pad);
-                            storeu_block(ct_ptr as *mut __m128i, ct_block);
-                            ct_ptr = ct_ptr.add(rem_pt1 + pt2.len());
-                        } else {
-                            // Reassemble one full block from pt1 tail + pt2 head
-                            let need = 16 - rem_pt1;
-                            let shuf = shift_left_mask(rem_pt1);
-                            let pt2b = shuffle_block(Self::load_partial_block(pt2_ptr, need), shuf);
-                            let pt1 = Self::load_partial_block(pt1_ptr, rem_pt1);
-                            let block = blendv_block(pt2b, pt1, shuf);
-
-                            block_num += 1;
-                            let tz = block_num.trailing_zeros() as usize;
-                            offset = xor_block(offset, table_get(&self.l, tz));
-                            let ct = self.encrypt_key.aes_encrypt_block(xor_block(offset, block));
-                            storeu_block(ct_ptr as *mut __m128i, xor_block(ct, offset));
-                            checksum = xor_block(checksum, block);
-                            ct_ptr = ct_ptr.add(16);
-                            pt2_ptr = pt2_ptr.add(need);
-
-                            let remaining_pt2 = pt2.len() - need;
-                            let full_blocks_pt2 = remaining_pt2 / 16;
-                            let rem_pt2 = remaining_pt2 & 15;
-
-                            (pt2_ptr, ct_ptr, offset) = self.enc_unaligned_contiguous(
-                                pt2_ptr,
-                                ct_ptr,
-                                full_blocks_pt2,
-                                &mut block_num,
-                                offset,
-                                &mut checksum,
-                            );
-                            if rem_pt2 > 0 {
-                                (ct_ptr, offset, checksum) =
-                                    self.enc_tail(pt2_ptr, rem_pt2, ct_ptr, offset, checksum);
-                            }
-                        }
-                    } else {
-                        // rem_pt1 == 0, pt2 continues directly
-                        let full_blocks_pt2 = pt2.len() / 16;
-                        let rem_pt2 = pt2.len() & 15;
-
-                        (pt2_ptr, ct_ptr, offset) = self.enc_unaligned_contiguous(
-                            pt2_ptr,
-                            ct_ptr,
-                            full_blocks_pt2,
-                            &mut block_num,
-                            offset,
-                            &mut checksum,
-                        );
-                        if rem_pt2 > 0 {
-                            (ct_ptr, offset, checksum) =
-                                self.enc_tail(pt2_ptr, rem_pt2, ct_ptr, offset, checksum);
-                        }
-                    }
-                    self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
-                    return Ok(());
-                }
-            };
-
-            let full_blocks = pt_len / 16;
-            let rem = pt_len & 15;
-
-            (pt_ptr, ct_ptr, offset) = self.enc_aligned_blocks(
-                pt_ptr,
-                ct_ptr,
-                full_blocks,
-                &mut block_num,
-                offset,
-                &mut checksum,
-            );
-            if rem > 0 {
-                (ct_ptr, offset, checksum) = self.enc_tail(pt_ptr, rem, ct_ptr, offset, checksum);
+        let (mut pt_ptr, mut ct_ptr, pt_len) = match io {
+            EncryptIO::InPlace(buf) => {
+                // The buffer holds the plaintext followed by a 16-byte tag slot.
+                let ct_ptr = buf.as_mut_ptr();
+                let pt_ptr = ct_ptr as *const u8;
+                (
+                    pt_ptr,
+                    ct_ptr,
+                    buf.len() - OCB_TAG_LEN as usize,
+                )
             }
-            self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
+            EncryptIO::OutOfPlace {
+                in_pt: PlainText::Contiguous(pt),
+                out,
+            } => (pt.as_ptr(), out.as_mut_ptr(), pt.len()),
+            EncryptIO::OutOfPlace {
+                in_pt: PlainText::Scattered(pt1, pt2),
+                out,
+            } => {
+                let pt1_ptr = pt1.as_ptr();
+                let pt2_ptr = pt2.as_ptr();
+                let pt1_len = pt1.len();
+                let pt2_len = pt2.len();
+                let ct_ptr = out.as_mut_ptr();
+
+                return self.enc_scatter(
+                    pt1_ptr, pt2_ptr, pt1_len, pt2_len, ct_ptr, offset, checksum, block_num, ad,
+                );
+            }
+
+            EncryptIO::MixedPlace { out, part, at } => {
+                let ct_ptr = out.as_mut_ptr();
+                let payload = out.len() - OCB_TAG_LEN as usize;
+                let part_len = part.len();
+                //SAFETY: EncryptIO::validate() guarantees part_len + OCB_TAG_LEN <= out.len(),
+                //so `payload - part_len` cannot underflow and `ct_ptr.add(part_len)` stays
+                //inside `out`.
+                let (head_ptr, head_len, tail_ptr, tail_len) = match at {
+                    Placement::Head => (
+                        part.as_ptr(),
+                        part_len,
+                        unsafe { ct_ptr.add(part_len) } as *const u8,
+                        payload - part_len,
+                    ),
+                    Placement::Tail => (
+                        ct_ptr as *const u8,
+                        payload - part_len,
+                        part.as_ptr(),
+                        part_len,
+                    ),
+                };
+
+                return self.enc_scatter(
+                    head_ptr, tail_ptr, head_len, tail_len, ct_ptr, offset, checksum, block_num, ad,
+                );
+            }
+        };
+
+        let full_blocks = pt_len / 16;
+        let rem = pt_len & 15;
+
+        (pt_ptr, ct_ptr, offset) = self.enc_aligned_blocks(
+            pt_ptr,
+            ct_ptr,
+            full_blocks,
+            &mut block_num,
+            offset,
+            &mut checksum,
+        );
+        if rem > 0 {
+            (ct_ptr, offset, checksum) = self.enc_tail(pt_ptr, rem, ct_ptr, offset, checksum);
         }
+        self.compute_and_store_tag(ct_ptr, offset, checksum, ad);
         Ok(())
     }
 }
@@ -1093,7 +1136,7 @@ impl AEctx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EncryptIO, PlainText};
+    use crate::{EncryptIO, Placement, PlainText};
     // Note:
     // These tests were generated using Qwen-3.8-27B on local hardware, feeding the LLM
     // with the output test vectors of the original C implementation, and asking it to exercice
@@ -1106,12 +1149,7 @@ mod tests {
     }
 
     /// Encrypt out-of-place with contiguous plaintext. Returns (ct, tag).
-    fn enc_contiguous(
-        ctx: &AEctx,
-        nonce: &[u8; 12],
-        pt: &[u8],
-        ad: &[u8],
-    ) -> (Vec<u8>, [u8; 16]) {
+    fn enc_contiguous(ctx: &AEctx, nonce: &[u8; 12], pt: &[u8], ad: &[u8]) -> (Vec<u8>, [u8; 16]) {
         let mut out = vec![0u8; pt.len() + 16];
         ctx.ae_encrypt(
             EncryptIO::OutOfPlace {
@@ -1127,12 +1165,7 @@ mod tests {
     }
 
     /// Encrypt in place. Returns (ct, tag).
-    fn enc_in_place(
-        ctx: &AEctx,
-        nonce: &[u8; 12],
-        pt: &[u8],
-        ad: &[u8],
-    ) -> (Vec<u8>, [u8; 16]) {
+    fn enc_in_place(ctx: &AEctx, nonce: &[u8; 12], pt: &[u8], ad: &[u8]) -> (Vec<u8>, [u8; 16]) {
         let mut buf = pt.to_vec();
         buf.extend([0u8; 16]);
         ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), nonce, ad)
@@ -1163,8 +1196,46 @@ mod tests {
         (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
     }
 
+    /// Encrypt mixed-place with the externally supplied half of length `split` at
+    /// `at`; the other half already sits in `out`. Returns (ct, tag).
+    fn enc_mixed(
+        ctx: &AEctx,
+        nonce: &[u8; 12],
+        pt: &[u8],
+        split: usize,
+        at: Placement,
+        ad: &[u8],
+    ) -> (Vec<u8>, [u8; 16]) {
+        // 0xAA, not 0x00: if the implementation reads the half that must come from
+        // `part` out of `out` instead, it encrypts canary bytes and every vector fails.
+        let mut out = vec![0xAAu8; pt.len() + 16];
+        let part = match at {
+            Placement::Head => {
+                out[split..pt.len()].copy_from_slice(&pt[split..]);
+                &pt[..split]
+            }
+            Placement::Tail => {
+                out[..split].copy_from_slice(&pt[..split]);
+                &pt[split..]
+            }
+        };
+        ctx.ae_encrypt(
+            EncryptIO::MixedPlace {
+                out: &mut out,
+                part,
+                at,
+            },
+            nonce,
+            ad,
+        )
+        .expect("encrypt failed");
+        let (ct, tag) = out.split_at(pt.len());
+        (ct.to_vec(), tag.try_into().expect("tag is 16 bytes"))
+    }
+
     /// Check one vector in every API mode: in place, out-of-place contiguous,
-    /// and out-of-place scattered at every split point.
+    /// out-of-place scattered at every split point, and mixed place at every split
+    /// point with the external half on either end.
     fn check_vector(ptl: usize, adl: usize, ct_exp: &[u8], tag_exp: &[u8]) {
         let (pt, ad) = (spec_data(ptl), spec_data(adl));
 
@@ -1222,6 +1293,35 @@ mod tests {
                 adl
             );
         }
+
+        let ctx = AEctx::new(&SPEC_KEY);
+        for split in 0..=ptl {
+            for at in [Placement::Head, Placement::Tail] {
+                let which = match at {
+                    Placement::Head => "head",
+                    Placement::Tail => "tail",
+                };
+                let (ct, tag) = enc_mixed(&ctx, &SPEC_NONCE, &pt, split, at, &ad);
+                assert_eq!(
+                    ct.as_slice(),
+                    ct_exp,
+                    "mixed {} split={} ct mismatch for ptl={} adl={}",
+                    which,
+                    split,
+                    ptl,
+                    adl
+                );
+                assert_eq!(
+                    &tag[..],
+                    tag_exp,
+                    "mixed {} split={} tag mismatch for ptl={} adl={}",
+                    which,
+                    split,
+                    ptl,
+                    adl
+                );
+            }
+        }
     }
 
     #[test]
@@ -1257,6 +1357,57 @@ mod tests {
                     "scattered split={} tag mismatch for ptl={}",
                     split, ptl
                 );
+            }
+
+            // The (identical) ciphertext must decrypt back to the plaintext.
+            let mut buf = ct_cont;
+            buf.extend_from_slice(&tag_cont);
+            let ctx = AEctx::new(&SPEC_KEY);
+            ctx.ae_decrypt(DecryptIO::InPlace(&mut buf), &SPEC_NONCE, &ad)
+                .expect("decrypt failed");
+            assert_eq!(
+                &buf[..ptl],
+                pt.as_slice(),
+                "decrypt roundtrip mismatch for ptl={}",
+                ptl
+            );
+        }
+    }
+
+    /// The spec vectors use plaintext lengths that are multiples of 8, so their
+    /// split points only ever give `rem_pt1` of 0 or 8. This covers the remaining
+    /// blended-tail branches (`1 <= rem_pt1 + pt2_len < 16` and the full-block
+    /// reassembly for every `rem_pt1`), the same way
+    /// `scattered_two_tail_differential` does for scattered plaintext. Mixed
+    /// encryption must match contiguous encryption byte for byte, and the result
+    /// must decrypt back.
+    #[test]
+    fn mixed_two_tail_differential() {
+        for ptl in 1..=64usize {
+            let (pt, ad) = (spec_data(ptl), spec_data(ptl / 2));
+
+            let ctx = AEctx::new(&SPEC_KEY);
+            let (ct_cont, tag_cont) = enc_contiguous(&ctx, &SPEC_NONCE, &pt, &ad);
+
+            let ctx = AEctx::new(&SPEC_KEY);
+            for split in 0..=ptl {
+                for at in [Placement::Head, Placement::Tail] {
+                    let which = match at {
+                        Placement::Head => "head",
+                        Placement::Tail => "tail",
+                    };
+                    let (ct, tag) = enc_mixed(&ctx, &SPEC_NONCE, &pt, split, at, &ad);
+                    assert_eq!(
+                        ct, ct_cont,
+                        "mixed {} split={} ct mismatch for ptl={}",
+                        which, split, ptl
+                    );
+                    assert_eq!(
+                        tag, tag_cont,
+                        "mixed {} split={} tag mismatch for ptl={}",
+                        which, split, ptl
+                    );
+                }
             }
 
             // The (identical) ciphertext must decrypt back to the plaintext.
@@ -1484,11 +1635,14 @@ mod tests {
         let mut buf = [0u8; 16 + OCB_TAG_LEN as usize];
 
         assert_eq!(ctx.ktop.seq.load(Ordering::Relaxed), 0);
-    
+
         nonce[11] = 0;
         ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, &[])
             .expect("encrypt failed");
-        let mut cache = [ctx.ktop.cached_top[0].load(Ordering::Relaxed), ctx.ktop.cached_top[1].load(Ordering::Relaxed)]; 
+        let mut cache = [
+            ctx.ktop.cached_top[0].load(Ordering::Relaxed),
+            ctx.ktop.cached_top[1].load(Ordering::Relaxed),
+        ];
         for i in 1..256usize {
             nonce[11] = i as u8;
             ctx.ae_encrypt(EncryptIO::InPlace(&mut buf), &nonce, &[])
@@ -1496,10 +1650,13 @@ mod tests {
 
             if i % 64 == 0 {
                 assert!(
-                    (ctx.ktop.cached_top[0].load(Ordering::Relaxed) != cache[0]) ||
-                    (ctx.ktop.cached_top[1].load(Ordering::Relaxed) != cache[1])
+                    (ctx.ktop.cached_top[0].load(Ordering::Relaxed) != cache[0])
+                        || (ctx.ktop.cached_top[1].load(Ordering::Relaxed) != cache[1])
                 );
-                cache = [ctx.ktop.cached_top[0].load(Ordering::Relaxed), ctx.ktop.cached_top[1].load(Ordering::Relaxed)]; 
+                cache = [
+                    ctx.ktop.cached_top[0].load(Ordering::Relaxed),
+                    ctx.ktop.cached_top[1].load(Ordering::Relaxed),
+                ];
             } else {
                 assert_eq!(ctx.ktop.cached_top[0].load(Ordering::Relaxed), cache[0]);
                 assert_eq!(ctx.ktop.cached_top[1].load(Ordering::Relaxed), cache[1]);
