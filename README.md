@@ -7,7 +7,9 @@ for encrypted transport protocols such as QUIC, Tor or any protocol
 mixing application data and protocol level controls during encryption.
 In particular, the encryption efficiently supports a scattered input
 buffer capturing common usage of one buffer for application data, and
-one buffer for protocol-level controls. The decryption is atomic and
+one buffer for protocol-level controls, and it encrypts a payload that
+already sits in its destination buffer while the other half of that
+payload is supplied separately. The decryption is atomic and
 does not let the application play with partial yet not authenticated
 plaintexts.
 
@@ -33,7 +35,9 @@ RUSTFLAGS="-C target-feature=+avx,+aes" cargo build
 ## Encryption
 
 We can encrypt using the API either **in place**, or **out of place**
-from a contiguous buffer, or **out of place** from a scattered buffer.
+from a contiguous buffer, or **out of place** from a scattered buffer,
+or in **mixed place**, where the destination buffer also supplies one
+half of the plaintext.
 
 **In place.** The buffer holds the plaintext followed by a 16-byte tag;
 on return it holds the ciphertext followed by the tag:
@@ -89,8 +93,7 @@ let ad: &[u8] = b"protocol header";
 
 let control: &[u8] = b"frame header";
 let payload: &[u8] = b"application data";
-let mut ct = vec![0u8; control.len() + payload.len() + ocb3::OCB_TAG_LEN
-as usize];
+let mut ct = vec![0u8; control.len() + payload.len() + ocb3::OCB_TAG_LEN as usize];
 
 let ctx = AEctx::new(&key);
 ctx.ae_encrypt(
@@ -107,13 +110,47 @@ ctx.ae_encrypt(
 A size violation returns `Err(CryptoError::DestinationSizeUnfit)` or
 `Err(CryptoError::PlaintextTooLong)`.
 
+**Mixed place.** When the payload already sits in the buffer we encrypt
+into, and only the other half has to be added, `EncryptIO::MixedPlace`
+encrypts both halves without copying the payload out first. `out` holds
+the whole payload followed by the tag slot, so it must be exactly the
+payload plus `OCB_TAG_LEN` bytes; `part` supplies the half named by
+`at`, and the ciphertext is written back over `out`:
+
+```rust
+use ocb3::{AEctx, EncryptIO, Placement};
+
+let key: [u8; 16] = [0u8; 16];
+let nonce: [u8; 12] = [0u8; 12];
+let ad: &[u8] = b"protocol header";
+
+let control: &[u8] = b"frame header";
+let mut buf = vec![0u8; control.len() + 16 + ocb3::OCB_TAG_LEN as usize];
+buf[control.len()..control.len() + 16].copy_from_slice(b"application data");
+
+let ctx = AEctx::new(&key);
+ctx.ae_encrypt(
+    EncryptIO::MixedPlace { out: &mut buf, part: control, at: Placement::Head },
+    &nonce,
+    ad,
+)
+.unwrap();
+// buf[..control.len() + 16] is the ciphertext, the rest is the tag
+```
+
+With `Placement::Head` the plaintext is `part` followed by the payload
+already in `out`; with `Placement::Tail` it is the payload in `out`
+followed by `part`. Mixed place is encryption only: decryption has
+`InPlace` and `OutOfPlace` and no mixed variant.
+
 ## Decryption
 
 The input is `ciphertext || tag`, encrypted with the same key, nonce and
 associated data. `ae_decrypt` verifies the tag with a constant-time
 comparison: on a mismatch it returns `Err(CryptoError::TagInvalid)` and wipes
 everything it may have written to the destination, so no partial plaintext
-survives a failed call. We can decrypt either in place or out of place:
+survives a failed call. We can decrypt either in place or out of place
+(there is no mixed-place decryption):
 
 **In place.** The buffer `ciphertext || tag` becomes `plaintext || tag`; the
 tag is left in place:
