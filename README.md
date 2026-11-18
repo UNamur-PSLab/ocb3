@@ -1,3 +1,9 @@
+## Status
+
+Experimental, in development.
+
+## Introduction
+
 This library is a partial rewrite of Ted Krovetz's optimized [C
 implementation](https://www.cs.ucdavis.edu/~rogaway/ocb/news/) of OCB3
 using AVX intrinsics.
@@ -203,6 +209,8 @@ ctx.ae_decrypt(
 ```
 
 ## Benchmarks
+
+TODO
 
 ## AI Disclosure
 
