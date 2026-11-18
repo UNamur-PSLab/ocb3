@@ -873,16 +873,17 @@ impl AEctx {
         let mut checksum = _mm_setzero_si128();
         let io_len = io.len();
 
-        let (mut ct_ptr, mut pt_ptr, fail_zero_len) = match io {
+        let (mut ct_ptr, mut pt_ptr, fail_zero_len, is_out_of_place) = match io {
             DecryptIO::InPlace(buf) => {
                 let pt_ptr = buf.as_mut_ptr();
                 let ct_ptr = pt_ptr as *const u8;
-                (ct_ptr, pt_ptr, buf.len())
+                (ct_ptr, pt_ptr, buf.len(), false)
             },
             DecryptIO::OutOfPlace { in_ct, out_pt } => (
                 in_ct.as_ptr(),
                 out_pt.as_mut_ptr(),
                 in_ct.len() - OCB_TAG_LEN as usize,
+                true
             ),
         };
         let out_start = pt_ptr;
@@ -995,10 +996,20 @@ impl AEctx {
             checksum = xor_block(checksum, pt_padded);
             let old = loadu_block(pt_ptr as *const __m128i);
             // SAFETY: blends the plaintext with the tag in the case of in-place decryption. In
-            // the out-of-place case, the destination buffer is at least pt_len + OCB_TAG_LEN
-            // bytes (see DecryptIO::validate).
+            // the out-of-place case, the destination buffer is at least pt_len.
             let blended = blendv_block(old, pt_zero_padded, mask);
-            storeu_block(pt_ptr as *mut __m128i, blended);
+            if !is_out_of_place {
+                storeu_block(pt_ptr as *mut __m128i, blended);
+            } else {
+                let blended = unsafe {
+                    std::slice::from_raw_parts((&raw const blended).cast::<u8>(), 16)
+                };
+                (0..remaining).for_each(|i| {
+                    unsafe {
+                        pt_ptr.add(i).write(blended[i]);
+                    }
+                });
+            }
             unsafe {
                 ct_ptr = ct_ptr.add(remaining);
             }
@@ -1466,7 +1477,7 @@ mod tests {
 
             // Out of place.
             let ctx = AEctx::new(&SPEC_KEY);
-            let mut out = vec![0xffu8; ptl + 16];
+            let mut out = vec![0xffu8; ptl];
             ctx.ae_decrypt(
                 DecryptIO::OutOfPlace {
                     in_ct: ct_tag,
