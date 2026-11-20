@@ -88,7 +88,8 @@ ctx.ae_encrypt(
 **Scattered plaintext.** When the protocol-level control bytes and the
 application data live in separate buffers, `PlainText::Scattered` encrypts
 both as a single contiguous plaintext; there is no need to reassemble
-before encryption:
+before encryption. The destination must have enough space to hold the
+ciphertext and tag:
 
 ```rust
 use ocb3::{AEctx, EncryptIO, PlainText};
